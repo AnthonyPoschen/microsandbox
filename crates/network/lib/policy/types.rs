@@ -16,8 +16,10 @@
 //!
 //! [`Rule::protocols`] and [`Rule::ports`] are sets (Vecs); a rule
 //! matches if the packet's protocol is in `protocols` or `protocols` is
-//! empty (any-protocol), and likewise for ports. This compresses common
-//! cases like "TCP-or-UDP on 80-or-443 to Public" into a single rule.
+//! empty (any-protocol), and likewise for ports. [`Rule::methods`] and
+//! [`Rule::paths`] are the same idea for plaintext HTTP/1 request lines
+//! (empty = any method / any path) and are only consulted when a
+//! request-target is available.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -113,8 +115,50 @@ pub struct Rule {
     #[serde(default)]
     pub ports: Vec<PortRange>,
 
+    /// HTTP method set (empty = any method). Evaluated only when a
+    /// plaintext HTTP/1 request line is available; skipped at SYN,
+    /// ICMP, DNS, and non-HTTP classification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<HttpMethod>,
+
+    /// HTTP path set (empty = any path). Compared against the
+    /// origin-form path of the request-target (query and fragment
+    /// stripped). Exact match, no glob.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+
     /// Action to take.
     pub action: Action,
+}
+
+/// HTTP/1 method filter for [`Rule::methods`].
+///
+/// Matching is ASCII case-insensitive. Empty `Rule::methods` means any
+/// method, including ones outside this set. The set is the methods
+/// defined in RFC 9110 plus the common extensions `PATCH` and `QUERY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    /// RFC 9110 `GET`.
+    Get,
+    /// RFC 9110 `HEAD`.
+    Head,
+    /// RFC 9110 `POST`.
+    Post,
+    /// RFC 9110 `PUT`.
+    Put,
+    /// RFC 9110 `DELETE`.
+    Delete,
+    /// RFC 9110 `CONNECT`.
+    Connect,
+    /// RFC 9110 `OPTIONS`.
+    Options,
+    /// RFC 9110 `TRACE`.
+    Trace,
+    /// RFC 5789 `PATCH`.
+    Patch,
+    /// RFC 9727 `QUERY`.
+    Query,
 }
 
 /// Direction a rule applies to.
@@ -250,8 +294,8 @@ impl HostnameSource<'_> {
     }
 }
 
-/// Outcome of an egress evaluation. Like [`Action`] plus a deferred
-/// state reachable only under [`HostnameSource::Deferred`].
+/// Outcome of an egress evaluation. Like [`Action`] plus deferred
+/// states reachable when hostname or HTTP request-line is not yet known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressEvaluation {
     /// Permit the connection.
@@ -261,6 +305,28 @@ pub enum EgressEvaluation {
     /// First match was a Domain / DomainSuffix rule and the SNI isn't
     /// known yet — accept the SYN and re-evaluate at first-flight.
     DeferUntilHostname,
+    /// First match was a method/path-filtered rule and the HTTP/1
+    /// request line isn't known yet — accept the SYN and re-evaluate
+    /// after plaintext classification.
+    DeferUntilHttp,
+}
+
+/// HTTP/1 request-line context for [`Rule::methods`] / [`Rule::paths`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpRequestMatch<'a> {
+    /// Handshake or first-flight time: method/path not yet known.
+    /// Rules with method/path filters defer instead of matching.
+    Unknown,
+    /// Classified as not plaintext HTTP/1. Rules with method/path
+    /// filters are skipped, same as port-filtered rules on ICMP.
+    NotHttp,
+    /// Parsed HTTP/1 request line.
+    Request {
+        /// Request method token (`GET`, `POST`, …).
+        method: &'a str,
+        /// Origin-form path with query and fragment stripped.
+        path: &'a str,
+    },
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -347,6 +413,7 @@ impl NetworkPolicy {
             protocol,
             shared,
             HostnameSource::CacheOnly,
+            HttpRequestMatch::NotHttp,
         )
         .into()
     }
@@ -360,8 +427,15 @@ impl NetworkPolicy {
         protocol: Protocol,
         shared: &SharedState,
     ) -> Action {
-        self.egress_walk(dst, None, protocol, shared, HostnameSource::CacheOnly)
-            .into()
+        self.egress_walk(
+            dst,
+            None,
+            protocol,
+            shared,
+            HostnameSource::CacheOnly,
+            HttpRequestMatch::NotHttp,
+        )
+        .into()
     }
 
     /// Evaluate only explicit, address-only egress rules and ignore the
@@ -381,6 +455,7 @@ impl NetworkPolicy {
                     Destination::Cidr(_) | Destination::Group(_)
                 )
                 || !rule.ports.is_empty()
+                || rule.has_http_filters()
                 || (!rule.protocols.is_empty() && !rule.protocols.contains(&protocol))
             {
                 continue;
@@ -403,7 +478,20 @@ impl NetworkPolicy {
         shared: &SharedState,
         source: HostnameSource<'_>,
     ) -> EgressEvaluation {
-        self.egress_walk(dst.ip(), Some(dst.port()), protocol, shared, source)
+        self.evaluate_egress_http(dst, protocol, shared, source, HttpRequestMatch::Unknown)
+    }
+
+    /// Evaluate an outbound connection with an explicit hostname source
+    /// and HTTP/1 request-line context for method/path filters.
+    pub fn evaluate_egress_http(
+        &self,
+        dst: SocketAddr,
+        protocol: Protocol,
+        shared: &SharedState,
+        source: HostnameSource<'_>,
+        http: HttpRequestMatch<'_>,
+    ) -> EgressEvaluation {
+        self.egress_walk(dst.ip(), Some(dst.port()), protocol, shared, source, http)
     }
 
     /// Return true when the first matching egress rule is an allow
@@ -445,6 +533,8 @@ impl NetworkPolicy {
 
     /// Shared rule walk for the egress public methods. `port = None`
     /// is the ICMP path; rules with a port filter are skipped there.
+    /// Method/path filters defer when [`HttpRequestMatch::Unknown`] and
+    /// are skipped when [`HttpRequestMatch::NotHttp`].
     fn egress_walk(
         &self,
         addr: IpAddr,
@@ -452,6 +542,7 @@ impl NetworkPolicy {
         protocol: Protocol,
         shared: &SharedState,
         source: HostnameSource<'_>,
+        http: HttpRequestMatch<'_>,
     ) -> EgressEvaluation {
         for (idx, rule) in self.rules.iter().enumerate() {
             if !matches!(rule.direction, Direction::Egress | Direction::Any) {
@@ -475,10 +566,21 @@ impl NetworkPolicy {
                 shared,
                 source,
             ) {
-                DestinationMatch::Match => return rule.action.into(),
+                DestinationMatch::Match => match http_filter_match(rule, http) {
+                    HttpFilterMatch::Match => return rule.action.into(),
+                    HttpFilterMatch::NoMatch => continue,
+                    HttpFilterMatch::Defer => return EgressEvaluation::DeferUntilHttp,
+                },
                 DestinationMatch::Defer => {
                     if rule.action.is_deny()
-                        && !self.deferred_tail_can_allow(idx + 1, addr, port, protocol, shared)
+                        && !self.deferred_tail_can_allow(
+                            idx + 1,
+                            addr,
+                            port,
+                            protocol,
+                            shared,
+                            http,
+                        )
                     {
                         return EgressEvaluation::Deny;
                     }
@@ -501,6 +603,7 @@ impl NetworkPolicy {
         port: Option<u16>,
         protocol: Protocol,
         shared: &SharedState,
+        http: HttpRequestMatch<'_>,
     ) -> bool {
         for rule in self.rules.iter().skip(start) {
             if !matches!(rule.direction, Direction::Egress | Direction::Any) {
@@ -525,7 +628,11 @@ impl NetworkPolicy {
                 shared,
                 HostnameSource::Deferred,
             ) {
-                DestinationMatch::Match => return rule.action.is_allow(),
+                DestinationMatch::Match => match http_filter_match(rule, http) {
+                    HttpFilterMatch::Match => return rule.action.is_allow(),
+                    HttpFilterMatch::Defer if rule.action.is_allow() => return true,
+                    HttpFilterMatch::Defer | HttpFilterMatch::NoMatch => continue,
+                },
                 DestinationMatch::Defer if rule.action.is_allow() => return true,
                 DestinationMatch::Defer | DestinationMatch::NoMatch => continue,
             }
@@ -573,6 +680,13 @@ impl NetworkPolicy {
         })
     }
 
+    /// True if any rule has a method or path filter. The TCP proxy uses
+    /// this to skip HTTP/1 request-line classification when no rule
+    /// could need it.
+    pub fn has_http_filters(&self) -> bool {
+        self.rules.iter().any(Rule::has_http_filters)
+    }
+
     /// Evaluate a DNS query name against egress policy.
     ///
     /// DNS queries do not have a resolved destination IP yet, so
@@ -605,6 +719,9 @@ impl NetworkPolicy {
     ) -> Action {
         for rule in &self.rules {
             if !matches!(rule.direction, Direction::Egress | Direction::Any) {
+                continue;
+            }
+            if rule.has_http_filters() {
                 continue;
             }
             let matched = match &rule.destination {
@@ -740,7 +857,7 @@ impl From<Action> for EgressEvaluation {
 }
 
 impl From<EgressEvaluation> for Action {
-    /// `DeferUntilHostname` is unreachable here (only the SYN handler
+    /// Deferred evaluations are unreachable here (only the SYN handler
     /// asks for deferral, and it doesn't request an `Action`). Debug
     /// builds panic; release falls back to `Deny`.
     fn from(eval: EgressEvaluation) -> Self {
@@ -754,7 +871,51 @@ impl From<EgressEvaluation> for Action {
                 );
                 Action::Deny
             }
+            EgressEvaluation::DeferUntilHttp => {
+                debug_assert!(
+                    false,
+                    "EgressEvaluation::DeferUntilHttp leaked through a NotHttp evaluator"
+                );
+                Action::Deny
+            }
         }
+    }
+}
+
+impl HttpMethod {
+    /// Canonical uppercase method token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Head => "HEAD",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+            HttpMethod::Delete => "DELETE",
+            HttpMethod::Connect => "CONNECT",
+            HttpMethod::Options => "OPTIONS",
+            HttpMethod::Trace => "TRACE",
+            HttpMethod::Patch => "PATCH",
+            HttpMethod::Query => "QUERY",
+        }
+    }
+
+    /// Parse a request-line method token. Matching is ASCII
+    /// case-insensitive.
+    pub fn from_token(token: &str) -> Option<Self> {
+        [
+            HttpMethod::Get,
+            HttpMethod::Head,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Delete,
+            HttpMethod::Connect,
+            HttpMethod::Options,
+            HttpMethod::Trace,
+            HttpMethod::Patch,
+            HttpMethod::Query,
+        ]
+        .into_iter()
+        .find(|method| token.eq_ignore_ascii_case(method.as_str()))
     }
 }
 
@@ -801,8 +962,15 @@ impl Rule {
             destination,
             protocols: Vec::new(),
             ports: Vec::new(),
+            methods: Vec::new(),
+            paths: Vec::new(),
             action,
         }
+    }
+
+    /// True when this rule constrains HTTP method or path.
+    pub fn has_http_filters(&self) -> bool {
+        !self.methods.is_empty() || !self.paths.is_empty()
     }
 
     /// Allow plain DNS (UDP/53 and TCP/53) to the sandbox gateway, i.e.
@@ -830,6 +998,8 @@ impl Rule {
             destination: Destination::Group(DestinationGroup::Host),
             protocols: vec![Protocol::Udp, Protocol::Tcp],
             ports: vec![PortRange::single(53)],
+            methods: Vec::new(),
+            paths: Vec::new(),
             action: Action::Allow,
         }
     }
@@ -884,6 +1054,83 @@ fn is_hostname_destination(dest: &Destination) -> bool {
     matches!(dest, Destination::Domain(_) | Destination::DomainSuffix(_))
 }
 
+fn http_filter_match(rule: &Rule, http: HttpRequestMatch<'_>) -> HttpFilterMatch {
+    if !rule.has_http_filters() {
+        return HttpFilterMatch::Match;
+    }
+    match http {
+        HttpRequestMatch::Unknown => HttpFilterMatch::Defer,
+        HttpRequestMatch::NotHttp => HttpFilterMatch::NoMatch,
+        HttpRequestMatch::Request { method, path } => {
+            if methods_match(&rule.methods, method) && paths_match(&rule.paths, path) {
+                HttpFilterMatch::Match
+            } else {
+                HttpFilterMatch::NoMatch
+            }
+        }
+    }
+}
+
+/// True when `methods` is empty (any) or contains `request_method`.
+pub fn methods_match(methods: &[HttpMethod], request_method: &str) -> bool {
+    methods.is_empty()
+        || methods
+            .iter()
+            .any(|method| method.as_str().eq_ignore_ascii_case(request_method))
+}
+
+/// True when `paths` is empty (any) or contains `request_path` exactly.
+pub fn paths_match(paths: &[String], request_path: &str) -> bool {
+    paths.is_empty() || paths.iter().any(|path| path == request_path)
+}
+
+/// Origin-form path of an HTTP/1 request-target: query and fragment
+/// stripped, absolute-form reduced to its path.
+pub fn normalize_http_path(target: &str) -> &str {
+    let without_fragment = target.split_once('#').map_or(target, |(path, _)| path);
+    let without_query = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(path, _)| path);
+    if let Some(scheme_end) = without_query.find("://") {
+        let after_scheme = &without_query[scheme_end + 3..];
+        if let Some(path_start) = after_scheme.find('/') {
+            return &after_scheme[path_start..];
+        }
+        return "/";
+    }
+    without_query
+}
+
+/// Parse method and origin-form path from a buffered HTTP/1 request.
+///
+/// Only the first request-line bytes are inspected, as ASCII. A binary
+/// body after the header block must not prevent classification. Returns
+/// `None` when the first line is not a complete HTTP/1 request line.
+/// The path is normalized via [`normalize_http_path`].
+pub fn parse_http1_request_line(buf: &[u8]) -> Option<(&str, &str)> {
+    if buf.first() == Some(&0x16) {
+        return None;
+    }
+    let mut line = buf;
+    while line.starts_with(b"\r\n") {
+        line = &line[2..];
+    }
+    let line_end = line.windows(2).position(|window| window == b"\r\n")?;
+    let line = &line[..line_end];
+    if !line.is_ascii() {
+        return None;
+    }
+    let line = std::str::from_utf8(line).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some() || !version.starts_with("HTTP/1.") {
+        return None;
+    }
+    Some((method, normalize_http_path(target)))
+}
+
 /// Internal helper: does this rule match a flow's address/port/protocol?
 ///
 /// The direction filter is applied by the caller (`evaluate_egress` /
@@ -896,6 +1143,10 @@ fn rule_matches(
     protocol: Protocol,
     shared: &SharedState,
 ) -> bool {
+    if rule.has_http_filters() {
+        // Ingress has no HTTP request-target; skip L7-constrained rules.
+        return false;
+    }
     if !rule.protocols.is_empty() && !rule.protocols.contains(&protocol) {
         return false;
     }
@@ -917,6 +1168,12 @@ fn rule_matches(
 /// [`HostnameSource::Deferred`] and the destination is `Domain` or
 /// `DomainSuffix`.
 enum DestinationMatch {
+    Match,
+    NoMatch,
+    Defer,
+}
+
+enum HttpFilterMatch {
     Match,
     NoMatch,
     Defer,
@@ -1186,6 +1443,8 @@ mod tests {
             destination: Destination::Domain(domain.parse().unwrap()),
             protocols: vec![Protocol::Tcp],
             ports: vec![PortRange::single(443)],
+            methods: Vec::new(),
+            paths: Vec::new(),
             action: Action::Allow,
         }
     }
@@ -1349,6 +1608,8 @@ mod tests {
                     destination: Destination::Cidr("151.101.0.0/16".parse().unwrap()),
                     protocols: Vec::new(),
                     ports: Vec::new(),
+                    methods: Vec::new(),
+                    paths: Vec::new(),
                     action: Action::Deny,
                 },
             ],
@@ -1369,6 +1630,8 @@ mod tests {
                 destination: Destination::Domain("pypi.org".parse().unwrap()),
                 protocols: vec![Protocol::Udp],
                 ports: vec![PortRange::single(443)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1589,6 +1852,8 @@ mod tests {
                     destination: Destination::Group(DestinationGroup::LinkLocal),
                     protocols: vec![Protocol::Tcp, Protocol::Icmpv4],
                     ports: vec![],
+                    methods: Vec::new(),
+                    paths: Vec::new(),
                     action: Action::Allow,
                 },
                 Rule {
@@ -1596,6 +1861,8 @@ mod tests {
                     destination: Destination::DomainSuffix(".example.com".parse().unwrap()),
                     protocols: vec![],
                     ports: vec![],
+                    methods: Vec::new(),
+                    paths: Vec::new(),
                     action: Action::Deny,
                 },
             ],
@@ -1645,6 +1912,8 @@ mod tests {
                 destination: Destination::Group(DestinationGroup::Public),
                 protocols: vec![Protocol::Tcp, Protocol::Udp],
                 ports: vec![PortRange::single(443)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1678,6 +1947,8 @@ mod tests {
                 destination: Destination::Group(DestinationGroup::Public),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(80), PortRange::single(443)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1844,6 +2115,8 @@ mod tests {
                 destination: Destination::Group(DestinationGroup::Host),
                 protocols: vec![Protocol::Udp],
                 ports: vec![PortRange::single(53)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1889,6 +2162,8 @@ mod tests {
                 destination: Destination::Domain(name("evil.com")),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(443)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Deny,
             }],
         };
@@ -1909,6 +2184,8 @@ mod tests {
                 destination: Destination::Domain(name("good.com")),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(443)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1941,6 +2218,8 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Udp],
                 ports: vec![],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1964,6 +2243,8 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Udp],
                 ports: vec![PortRange::single(53)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -2410,6 +2691,8 @@ mod tests {
                 destination: Destination::Domain(name("pypi.org")),
                 protocols: vec![Protocol::Udp], // wrong protocol
                 ports: vec![],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -2429,6 +2712,8 @@ mod tests {
                 destination: Destination::Domain(name("pypi.org")),
                 protocols: vec![],
                 ports: vec![PortRange::single(80)], // wrong port
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -2688,5 +2973,263 @@ mod tests {
             &policy.rules[1].destination,
             Destination::Domain(_),
         ));
+    }
+
+    fn http_rule(methods: Vec<HttpMethod>, paths: Vec<&str>, action: Action) -> Rule {
+        Rule {
+            direction: Direction::Egress,
+            destination: Destination::Any,
+            protocols: vec![Protocol::Tcp],
+            ports: Vec::new(),
+            methods,
+            paths: paths.into_iter().map(str::to_string).collect(),
+            action,
+        }
+    }
+
+    fn eval_http(
+        policy: &NetworkPolicy,
+        method: &str,
+        path: &str,
+        shared: &SharedState,
+    ) -> EgressEvaluation {
+        policy.evaluate_egress_http(
+            sock("1.2.3.4", 80),
+            Protocol::Tcp,
+            shared,
+            HostnameSource::CacheOnly,
+            HttpRequestMatch::Request { method, path },
+        )
+    }
+
+    #[test]
+    fn http_filters_first_match_allow_and_deny_by_method_and_path() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![
+                http_rule(
+                    vec![HttpMethod::Get, HttpMethod::Head],
+                    vec!["/allowed"],
+                    Action::Allow,
+                ),
+                http_rule(
+                    vec![HttpMethod::Post, HttpMethod::Put],
+                    vec!["/write"],
+                    Action::Allow,
+                ),
+                http_rule(vec![HttpMethod::Post], vec!["/admin"], Action::Deny),
+            ],
+        };
+
+        assert_eq!(
+            eval_http(&policy, "GET", "/allowed", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "HEAD", "/allowed", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "POST", "/write", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "PUT", "/write", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "POST", "/allowed", &shared),
+            EgressEvaluation::Deny
+        );
+        assert_eq!(
+            eval_http(&policy, "GET", "/write", &shared),
+            EgressEvaluation::Deny
+        );
+        assert_eq!(
+            eval_http(&policy, "GET", "/other", &shared),
+            EgressEvaluation::Deny
+        );
+        assert_eq!(
+            eval_http(&policy, "POST", "/admin", &shared),
+            EgressEvaluation::Deny
+        );
+    }
+
+    #[test]
+    fn rfc9110_and_extension_methods_round_trip_tokens() {
+        for method in [
+            HttpMethod::Get,
+            HttpMethod::Head,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Delete,
+            HttpMethod::Connect,
+            HttpMethod::Options,
+            HttpMethod::Trace,
+            HttpMethod::Patch,
+            HttpMethod::Query,
+        ] {
+            assert_eq!(HttpMethod::from_token(method.as_str()), Some(method));
+            assert_eq!(
+                HttpMethod::from_token(&method.as_str().to_ascii_lowercase()),
+                Some(method)
+            );
+        }
+        assert_eq!(HttpMethod::from_token("UNKNOWN"), None);
+
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![
+                http_rule(vec![HttpMethod::Delete], vec!["/item"], Action::Allow),
+                http_rule(vec![HttpMethod::Patch], vec!["/item"], Action::Allow),
+                http_rule(vec![HttpMethod::Query], vec!["/search"], Action::Allow),
+                http_rule(vec![HttpMethod::Options], vec!["/"], Action::Allow),
+            ],
+        };
+        assert_eq!(
+            eval_http(&policy, "DELETE", "/item", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "PATCH", "/item", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "QUERY", "/search", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "OPTIONS", "/", &shared),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            eval_http(&policy, "TRACE", "/", &shared),
+            EgressEvaluation::Deny
+        );
+    }
+
+    #[test]
+    fn omitted_method_and_path_keys_match_any_http_request() {
+        let json = r#"{
+            "default_egress": "deny",
+            "default_ingress": "allow",
+            "rules": [{
+                "direction": "egress",
+                "destination": "any",
+                "protocols": ["tcp"],
+                "action": "allow"
+            }]
+        }"#;
+        let policy: NetworkPolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.rules[0].methods.is_empty());
+        assert!(policy.rules[0].paths.is_empty());
+        assert!(!policy.has_http_filters());
+
+        let shared = SharedState::new(4);
+        for (method, path) in [
+            ("GET", "/"),
+            ("HEAD", "/index"),
+            ("POST", "/submit"),
+            ("PUT", "/item"),
+            ("DELETE", "/other"),
+        ] {
+            assert_eq!(
+                eval_http(&policy, method, path, &shared),
+                EgressEvaluation::Allow,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_deny_l7_allow_defers_syn_instead_of_denying() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![http_rule(vec![HttpMethod::Get], vec!["/ok"], Action::Allow)],
+        };
+        let dst = sock("1.2.3.4", 80);
+
+        assert_eq!(
+            policy.evaluate_egress_with_source(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                HostnameSource::Deferred
+            ),
+            EgressEvaluation::DeferUntilHttp,
+            "SYN-time evaluation must not deny a method/path-only allow"
+        );
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                HostnameSource::CacheOnly,
+                HttpRequestMatch::Request {
+                    method: "GET",
+                    path: "/ok",
+                },
+            ),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                HostnameSource::CacheOnly,
+                HttpRequestMatch::Request {
+                    method: "POST",
+                    path: "/ok",
+                },
+            ),
+            EgressEvaluation::Deny
+        );
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                HostnameSource::CacheOnly,
+                HttpRequestMatch::NotHttp,
+            ),
+            EgressEvaluation::Deny
+        );
+    }
+
+    #[test]
+    fn normalize_http_path_strips_query_and_absolute_form() {
+        assert_eq!(normalize_http_path("/api"), "/api");
+        assert_eq!(normalize_http_path("/api?x=1"), "/api");
+        assert_eq!(normalize_http_path("/api#frag"), "/api");
+        assert_eq!(normalize_http_path("http://example.com/api?x=1"), "/api");
+        assert_eq!(normalize_http_path("http://example.com"), "/");
+        assert_eq!(
+            parse_http1_request_line(b"GET /allowed?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            Some(("GET", "/allowed"))
+        );
+        let mut post_with_binary = b"POST /allowed HTTP/1.1\r\nContent-Length: 4\r\n\r\n".to_vec();
+        post_with_binary.extend_from_slice(&[0xff, 0xfe, 0x00, 0x80]);
+        assert_eq!(
+            parse_http1_request_line(&post_with_binary),
+            Some(("POST", "/allowed"))
+        );
+        assert_eq!(parse_http1_request_line(b"PRI * HTTP/2.0\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn methods_and_paths_helpers_treat_empty_as_any() {
+        assert!(methods_match(&[], "GET"));
+        assert!(methods_match(&[HttpMethod::Get], "get"));
+        assert!(!methods_match(&[HttpMethod::Get], "POST"));
+        assert!(paths_match(&[], "/any"));
+        assert!(paths_match(&["/a".to_string()], "/a"));
+        assert!(!paths_match(&["/a".to_string()], "/b"));
     }
 }

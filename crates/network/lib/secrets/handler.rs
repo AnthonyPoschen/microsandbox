@@ -17,7 +17,7 @@ use super::config::{
     HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretsConfig, ViolationAction,
 };
 use crate::netstack::shared::SharedState;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::{EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -210,6 +210,8 @@ enum HttpAuthorityValidator {
 
 /// Parsed HTTP/1 request metadata needed for validation and framing.
 struct HttpRequestMetadata {
+    method: String,
+    path: String,
     host_headers: Vec<String>,
     target_authority: Option<String>,
 }
@@ -2040,19 +2042,68 @@ fn validate_http1_authority(
     metadata: &HttpRequestMetadata,
     validator: &HttpAuthorityValidator,
 ) -> Result<(), ViolationAction> {
-    if metadata.host_headers.len() != 1 {
-        return Err(ViolationAction::Block);
-    }
+    let http = HttpRequestMatch::Request {
+        method: &metadata.method,
+        path: &metadata.path,
+    };
+    match validator {
+        HttpAuthorityValidator::Sni(_) => {
+            if metadata.host_headers.len() != 1 {
+                return Err(ViolationAction::Block);
+            }
+            for authority in metadata
+                .host_headers
+                .iter()
+                .chain(metadata.target_authority.iter())
+            {
+                validate_authority(authority, validator, http)?;
+            }
+            Ok(())
+        }
+        HttpAuthorityValidator::Policy {
+            guest_dst,
+            network_policy,
+            shared,
+        } => {
+            if network_policy.has_domain_rules() {
+                if metadata.host_headers.len() != 1 {
+                    return Err(ViolationAction::Block);
+                }
+                for authority in metadata
+                    .host_headers
+                    .iter()
+                    .chain(metadata.target_authority.iter())
+                {
+                    validate_authority(authority, validator, http)?;
+                }
+                return Ok(());
+            }
 
-    for authority in metadata
-        .host_headers
-        .iter()
-        .chain(metadata.target_authority.iter())
-    {
-        validate_authority(authority, validator)?;
+            // Method/path-only rules: classify the request line even when
+            // no Host header is present.
+            let host = metadata
+                .host_headers
+                .first()
+                .and_then(|authority| authority_hostname(authority))
+                .map(str::to_ascii_lowercase);
+            let source = match host.as_deref() {
+                Some(name) => HostnameSource::Sni(name),
+                None => HostnameSource::CacheOnly,
+            };
+            match network_policy.evaluate_egress_http(
+                *guest_dst,
+                Protocol::Tcp,
+                shared,
+                source,
+                http,
+            ) {
+                EgressEvaluation::Allow => Ok(()),
+                EgressEvaluation::Deny
+                | EgressEvaluation::DeferUntilHostname
+                | EgressEvaluation::DeferUntilHttp => Err(ViolationAction::Block),
+            }
+        }
     }
-
-    Ok(())
 }
 
 fn validate_http2_authority(
@@ -2066,10 +2117,10 @@ fn validate_http2_authority(
         if name.eq_ignore_ascii_case(b":authority") {
             authority_count += 1;
             let authority = String::from_utf8_lossy(value);
-            validate_authority(authority.as_ref(), validator)?;
+            validate_authority(authority.as_ref(), validator, HttpRequestMatch::NotHttp)?;
         } else if name.eq_ignore_ascii_case(b"host") {
             let host = String::from_utf8_lossy(value);
-            validate_authority(host.as_ref(), validator)?;
+            validate_authority(host.as_ref(), validator, HttpRequestMatch::NotHttp)?;
         }
     }
 
@@ -2083,6 +2134,7 @@ fn validate_http2_authority(
 fn validate_authority(
     authority: &str,
     validator: &HttpAuthorityValidator,
+    http: HttpRequestMatch<'_>,
 ) -> Result<(), ViolationAction> {
     match validator {
         HttpAuthorityValidator::Sni(sni) => authority_matches_sni(authority, sni)
@@ -2098,16 +2150,17 @@ fn validate_authority(
             };
             let hostname = hostname.to_ascii_lowercase();
             let authority_dst = SocketAddr::new(guest_dst.ip(), guest_dst.port());
-            match network_policy.evaluate_egress_with_source(
+            match network_policy.evaluate_egress_http(
                 authority_dst,
                 Protocol::Tcp,
                 shared,
                 HostnameSource::Sni(&hostname),
+                http,
             ) {
                 EgressEvaluation::Allow => Ok(()),
-                EgressEvaluation::Deny | EgressEvaluation::DeferUntilHostname => {
-                    Err(ViolationAction::Block)
-                }
+                EgressEvaluation::Deny
+                | EgressEvaluation::DeferUntilHostname
+                | EgressEvaluation::DeferUntilHttp => Err(ViolationAction::Block),
             }
         }
     }
@@ -2163,11 +2216,9 @@ fn parse_http_request_metadata(
         }
     }
 
-    if host_headers.is_empty() {
-        return Err(ViolationAction::Block);
-    }
-
     Ok(Some(HttpRequestMetadata {
+        method: method.to_string(),
+        path: crate::policy::normalize_http_path(target).to_string(),
         host_headers,
         target_authority,
     }))

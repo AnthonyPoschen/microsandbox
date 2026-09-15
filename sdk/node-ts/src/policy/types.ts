@@ -7,6 +7,19 @@ export type Direction = "egress" | "ingress" | "any";
 /** Transport protocol filter. Empty `Rule.protocols` means "any protocol". */
 export type Protocol = "tcp" | "udp" | "icmpv4" | "icmpv6";
 
+/** HTTP/1 method filter. Empty `Rule.methods` means "any method". */
+export type HttpMethod =
+  | "GET"
+  | "HEAD"
+  | "POST"
+  | "PUT"
+  | "DELETE"
+  | "CONNECT"
+  | "OPTIONS"
+  | "TRACE"
+  | "PATCH"
+  | "QUERY";
+
 export type DestinationGroup =
   | "public"
   | "loopback"
@@ -51,6 +64,10 @@ export interface Rule {
   readonly protocols: readonly Protocol[];
   /** Empty = any port. Always interpreted as the guest-side port. */
   readonly ports: readonly PortRange[];
+  /** Empty / omitted = any HTTP method. */
+  readonly methods?: readonly HttpMethod[];
+  /** Empty / omitted = any HTTP path. Exact origin-form match. */
+  readonly paths?: readonly string[];
   readonly action: Action;
 }
 

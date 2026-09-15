@@ -467,6 +467,41 @@ fn ports<I: IntoIterator<Item = u16>>(&mut self, ports: I) -> &mut Self
 
 Add multiple single ports. Equivalent to calling [`port()`](#port-1) once per element.
 
+#### <span className="msb-recv">rule.</span><span className="msb-hn">method()</span>
+
+```rust
+fn method(&mut self, method: HttpMethod) -> &mut Self
+```
+
+Add an HTTP method to the method set. Empty set means any method. Matching is ASCII case-insensitive.
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">methods()</span>
+
+```rust
+fn methods<I: IntoIterator<Item = HttpMethod>>(&mut self, methods: I) -> &mut Self
+```
+
+Add several HTTP methods. Equivalent to calling [`method()`](#rule-method) once per element.
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">path()</span>
+
+```rust
+fn path(&mut self, path: impl Into<String>) -> &mut Self
+```
+
+Add an HTTP origin-form path. Empty set means any path. Matching is exact after query and fragment are stripped from the request-target.
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">paths()</span>
+
+```rust
+fn paths<I, S>(&mut self, paths: I) -> &mut Self
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+```
+
+Add several HTTP paths. Equivalent to calling [`path()`](#rule-path) once per element.
+
 #### <span className="msb-recv">rule.</span><span className="msb-hn">allow_public()</span>
 
 ```rust
@@ -1308,6 +1343,18 @@ Set semantics; empty = any protocol
 
 Set semantics; empty = any port
 
+#### <span className="msb-recv">Rule::</span><span className="msb-hn">methods</span>
+
+`Vec<`[`HttpMethod`](#httpmethod)`>`
+
+Set semantics; empty = any HTTP method. Evaluated only for plaintext HTTP/1 request lines. RFC 9110 methods plus `PATCH` and `QUERY`. Omitted filters keep SYN-time L4 matching unchanged.
+
+#### <span className="msb-recv">Rule::</span><span className="msb-hn">paths</span>
+
+`Vec<String>`
+
+Set semantics; empty = any path. Exact origin-form path match after query and fragment are stripped.
+
 #### <span className="msb-recv">Rule::</span><span className="msb-hn">action</span>
 
 [`Action`](#action)
@@ -1520,6 +1567,25 @@ Groups are disjoint with one carve-out: `Metadata` takes precedence over `LinkLo
 | `Icmpv6` | `"icmpv6"` |
 
 ICMP protocols are egress-only. A rule with direction `Ingress` or `Any` carrying an ICMP protocol fails build with [`BuildError::IngressDoesNotSupportIcmp`](#builderror).
+
+### HttpMethod
+
+<p className="msb-backref">Held by <a href="#rule">Rule.methods</a> · set by <a href="#rule-method">RuleBuilder method setters</a></p>
+
+| Value | Wire format |
+|-------|-------------|
+| `Get` | `"GET"` |
+| `Head` | `"HEAD"` |
+| `Post` | `"POST"` |
+| `Put` | `"PUT"` |
+| `Delete` | `"DELETE"` |
+| `Connect` | `"CONNECT"` |
+| `Options` | `"OPTIONS"` |
+| `Trace` | `"TRACE"` |
+| `Patch` | `"PATCH"` |
+| `Query` | `"QUERY"` |
+
+Empty `methods` means any HTTP method. Filters apply only to plaintext HTTP/1 request lines.
 
 ### Nameserver
 

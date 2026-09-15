@@ -360,6 +360,10 @@ func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 			for _, p := range r.Protocols {
 				rule.Protocols = append(rule.Protocols, string(p))
 			}
+			for _, method := range r.Methods {
+				rule.Methods = append(rule.Methods, string(method))
+			}
+			rule.Paths = append([]string(nil), r.Paths...)
 			cp.Rules = append(cp.Rules, rule)
 		}
 		out.CustomPolicy = cp

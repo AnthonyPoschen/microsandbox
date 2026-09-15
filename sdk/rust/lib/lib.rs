@@ -71,9 +71,9 @@ pub use sandbox::{
 };
 #[cfg(feature = "net")]
 pub use sandbox::{
-    DnsConfigPatch, HostPattern, InterfaceOverridesPatch, Nameserver, NetworkAction, NetworkPolicy,
-    NetworkProfile, NetworkRateLimiterConfigPatch, NetworkRule, OutboundProxy, PublishedPort,
-    SecretInjection, SecretsConfigPatch, Socks5Credentials, TlsConfigPatch,
+    DnsConfigPatch, HostPattern, HttpMethod, InterfaceOverridesPatch, Nameserver, NetworkAction,
+    NetworkPolicy, NetworkProfile, NetworkRateLimiterConfigPatch, NetworkRule, OutboundProxy,
+    PublishedPort, SecretInjection, SecretsConfigPatch, Socks5Credentials, TlsConfigPatch,
 };
 pub use snapshot::{
     CheckpointSnapshotState, FileSnapshotState, SaveOpts, Snapshot, SnapshotBuilder,

@@ -1342,6 +1342,8 @@ mod tests {
                 destination: Destination::Cidr("10.20.30.40/32".parse().unwrap()),
                 protocols: Vec::new(),
                 ports: Vec::new(),
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Deny,
             },
         );
@@ -1709,6 +1711,8 @@ mod tests {
                 destination: Destination::Cidr("8.8.8.8/32".parse().unwrap()),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Deny,
             }],
         };
@@ -1762,6 +1766,8 @@ mod tests {
                 destination: Destination::Cidr("1.1.1.1/32".parse().unwrap()),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Deny,
             }],
         };
@@ -1818,6 +1824,8 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Udp],
                 ports: vec![PortRange::single(53)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1844,6 +1852,8 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(853)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1860,6 +1870,8 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(53)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };

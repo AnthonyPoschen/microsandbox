@@ -21,7 +21,10 @@ use super::connection::ProxyConnectState;
 use super::connection::ProxyConnectStatus;
 use super::upstream::UpstreamTcpTarget;
 use crate::netstack::shared::SharedState;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::{
+    EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol,
+    parse_http1_request_line,
+};
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::config::{SecretsConfig, SecretsConfigExt, ViolationAction};
 use crate::secrets::handler::{
@@ -213,11 +216,17 @@ impl TcpProxy {
                 Some(name) => HostnameSource::Sni(name),
                 None => HostnameSource::CacheOnly,
             };
-            match network_policy.evaluate_egress_with_source(
+            let http = if initial_buf.first() == Some(&0x16) {
+                HttpRequestMatch::NotHttp
+            } else {
+                HttpRequestMatch::Unknown
+            };
+            match network_policy.evaluate_egress_http(
                 guest_dst,
                 Protocol::Tcp,
                 &shared,
                 source,
+                http,
             ) {
                 EgressEvaluation::Allow => {
                     if strict_hostname_allow_is_opaque(
@@ -247,6 +256,10 @@ impl TcpProxy {
                     proxy_connect.mark_policy_denied();
                     shared.proxy_wake.wake();
                     return Ok(());
+                }
+                EgressEvaluation::DeferUntilHttp => {
+                    // Method/path still unknown; classify the plaintext
+                    // request line after the upstream socket is open.
                 }
                 EgressEvaluation::DeferUntilHostname => {
                     debug_assert!(false, "DeferUntilHostname leaked into TCP proxy task");
@@ -298,10 +311,12 @@ impl TcpProxy {
         // is reused and this is cheap; with no secrets it is skipped entirely
         // (`is_tls` only matters for deciding whether to build the handler).
         let enforce_http_authority = network_policy.has_domain_rules();
+        let enforce_http_filters = network_policy.has_http_filters();
         let want_headers = enforce_http_authority
+            || enforce_http_filters
             || secrets.has_plain_http_candidates()
             || secrets.has_host_scoped_secrets();
-        let (initial_buf, is_tls) = if want_headers {
+        let (mut initial_buf, is_tls) = if want_headers {
             classify_first_flight(
                 initial_buf,
                 &mut from_smoltcp,
@@ -344,10 +359,45 @@ impl TcpProxy {
             .await;
         }
 
+        let http2_preface = is_http2_client_preface(&initial_buf);
+        let plaintext_http1 = !is_tls
+            && !http2_preface
+            && looks_like_http_request_prefix(&initial_buf)
+            && !first_line_is_not_http_request(&initial_buf);
+
+        let mut stop_after_replay = false;
+        if enforce_http_filters {
+            if plaintext_http1 {
+                let (allowed, stop) =
+                    take_allowed_http1_prefix(&network_policy, guest_dst, &shared, &initial_buf);
+                if allowed.is_empty() {
+                    tracing::debug!(
+                        dst = %guest_dst,
+                        "TCP egress denied by HTTP method/path policy",
+                    );
+                    return Ok(());
+                }
+                initial_buf = allowed;
+                stop_after_replay = stop;
+            } else if !http_request_allowed(
+                &network_policy,
+                guest_dst,
+                &shared,
+                &initial_buf,
+                is_tls || http2_preface,
+            ) {
+                tracing::debug!(
+                    dst = %guest_dst,
+                    "TCP egress denied by HTTP method/path policy",
+                );
+                return Ok(());
+            }
+        }
+
         let mut late_connect_state = tls_state;
         let mut secrets_handler: Option<SecretsHandler> = if is_tls {
             None
-        } else if enforce_http_authority {
+        } else if enforce_http_authority || (enforce_http_filters && plaintext_http1) {
             let host = extract_http_host(&initial_buf).unwrap_or_default();
             Some(SecretsHandler::new_plain_http_policy(
                 &secrets,
@@ -396,6 +446,10 @@ impl TcpProxy {
             }
         }
 
+        if stop_after_replay {
+            return Ok(());
+        }
+
         let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];
 
         // Bidirectional relay using tokio::select!.
@@ -435,8 +489,9 @@ impl TcpProxy {
                                 )
                                 .await;
                             }
-                            // No handler (no secrets / TLS) is the common path: forward
-                            // the chunk borrowed, with no per-chunk allocation or copy.
+                            // No handler (no secrets / TLS / HTTP filters) is the
+                            // common path: forward the chunk borrowed, with no
+                            // per-chunk allocation or copy.
                             let out: Cow<[u8]> = match secrets_handler.as_mut() {
                                 Some(h) => match h.substitute(&bytes) {
                                     Ok(cow) => cow,
@@ -998,6 +1053,92 @@ fn connect_response_is_success(headers: &[u8]) -> bool {
             .is_ok_and(|code| (200..300).contains(&code))
 }
 
+fn is_http2_client_preface(buf: &[u8]) -> bool {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    !buf.is_empty() && (buf.starts_with(PREFACE) || PREFACE.starts_with(buf))
+}
+
+fn http1_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn http1_content_length(headers: &[u8]) -> Option<usize> {
+    let mut rest = headers;
+    while let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") {
+        let line = &rest[..line_end];
+        rest = &rest[line_end + 2..];
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            continue;
+        };
+        let name = &line[..colon];
+        if !name.eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+        let value = std::str::from_utf8(&line[colon + 1..]).ok()?.trim();
+        return value.parse().ok();
+    }
+    None
+}
+
+fn next_http1_message_end(buf: &[u8]) -> Option<usize> {
+    let header_end = http1_header_end(buf)?;
+    let body_len = http1_content_length(&buf[..header_end]).unwrap_or(0);
+    let end = header_end.checked_add(body_len)?;
+    (buf.len() >= end).then_some(end)
+}
+
+/// Forward complete allowed HTTP/1 messages and drop a following denied
+/// request. `stop` is true when a denied request was encountered.
+fn take_allowed_http1_prefix(
+    policy: &NetworkPolicy,
+    guest_dst: SocketAddr,
+    shared: &SharedState,
+    buf: &[u8],
+) -> (Vec<u8>, bool) {
+    let mut rest = buf;
+    let mut allowed = Vec::new();
+    while !rest.is_empty() {
+        let Some(end) = next_http1_message_end(rest) else {
+            // Incomplete trailing bytes: do not forward them.
+            return (allowed, true);
+        };
+        let (message, tail) = rest.split_at(end);
+        if !http_request_allowed(policy, guest_dst, shared, message, false) {
+            return (allowed, true);
+        }
+        allowed.extend_from_slice(message);
+        rest = tail;
+    }
+    (allowed, false)
+}
+
+fn http_request_allowed(
+    policy: &NetworkPolicy,
+    guest_dst: SocketAddr,
+    shared: &SharedState,
+    buf: &[u8],
+    is_tls: bool,
+) -> bool {
+    let http = if is_tls || buf.is_empty() || is_http2_client_preface(buf) {
+        HttpRequestMatch::NotHttp
+    } else if let Some((method, path)) = parse_http1_request_line(buf) {
+        HttpRequestMatch::Request { method, path }
+    } else {
+        HttpRequestMatch::NotHttp
+    };
+    let host = extract_http_host(buf);
+    let source = match host.as_deref() {
+        Some(name) => HostnameSource::Sni(name),
+        None => HostnameSource::CacheOnly,
+    };
+    matches!(
+        policy.evaluate_egress_http(guest_dst, Protocol::Tcp, shared, source, http),
+        EgressEvaluation::Allow
+    )
+}
+
 /// Extract the `Host:` header value from an already-buffered HTTP header block.
 ///
 /// Returns `None` if:
@@ -1534,6 +1675,8 @@ mod tests {
             destination: Destination::Domain(domain.parse().unwrap()),
             protocols: vec![Protocol::Tcp],
             ports: vec![PortRange::single(443)],
+            methods: Vec::new(),
+            paths: Vec::new(),
             action: Action::Allow,
         }
     }
@@ -1544,6 +1687,8 @@ mod tests {
             destination: Destination::Domain(domain.parse().unwrap()),
             protocols: vec![Protocol::Tcp],
             ports: vec![PortRange::single(port)],
+            methods: Vec::new(),
+            paths: Vec::new(),
             action: Action::Allow,
         }
     }
@@ -1670,6 +1815,8 @@ mod tests {
                 destination: Destination::DomainSuffix(".pythonhosted.org".parse().unwrap()),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(443)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -1707,6 +1854,8 @@ mod tests {
                 destination: Destination::DomainSuffix(".pythonhosted.org".parse().unwrap()),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(443)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
@@ -2050,6 +2199,166 @@ mod tests {
         .await;
 
         assert_eq!(wire, b"GET /one HTTP/1.1\r\nHost: allowed.example\r\n\r\n");
+    }
+
+    fn http_method_path_policy(port: u16) -> NetworkPolicy {
+        NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Any,
+                protocols: vec![Protocol::Tcp],
+                ports: vec![PortRange::single(port)],
+                methods: vec![
+                    crate::policy::HttpMethod::Get,
+                    crate::policy::HttpMethod::Head,
+                    crate::policy::HttpMethod::Post,
+                    crate::policy::HttpMethod::Put,
+                ],
+                paths: vec!["/allowed".to_string()],
+                action: Action::Allow,
+            }],
+        }
+    }
+
+    async fn proxy_http_policy_once(request: &[u8], policy: NetworkPolicy) -> Vec<u8> {
+        let (addr, sink) = spawn_sink().await;
+        let mut policy = policy;
+        if let Some(rule) = policy.rules.first_mut()
+            && rule.ports.len() == 1
+        {
+            rule.ports[0] = PortRange::single(addr.port());
+        }
+        relay_through_proxy_with_policy(
+            request.to_vec(),
+            Arc::new(SharedState::new(4)),
+            Arc::new(policy),
+            SecretsConfig::default(),
+            sink,
+            addr,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn http_method_path_policy_allows_matching_request_and_blocks_others() {
+        let get_ok = b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let head_ok = b"HEAD /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let post_ok = b"POST /allowed HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let put_ok = b"PUT /allowed HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let post_bad_path =
+            b"POST /denied HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let get_bad_path = b"GET /denied HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let delete_denied = b"DELETE /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut post_binary = b"POST /allowed HTTP/1.1\r\nContent-Length: 4\r\n\r\n".to_vec();
+        post_binary.extend_from_slice(&[0xff, 0xfe, 0x00, 0x80]);
+        let pipelined = [get_ok.as_slice(), get_bad_path.as_slice()].concat();
+        let http2 = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+        for _ in 0..2 {
+            let policy = http_method_path_policy(80);
+            assert_eq!(proxy_http_policy_once(get_ok, policy.clone()).await, get_ok);
+            assert_eq!(
+                proxy_http_policy_once(head_ok, policy.clone()).await,
+                head_ok
+            );
+            assert_eq!(
+                proxy_http_policy_once(post_ok, policy.clone()).await,
+                post_ok
+            );
+            assert_eq!(proxy_http_policy_once(put_ok, policy.clone()).await, put_ok);
+            assert_eq!(
+                proxy_http_policy_once(&post_binary, policy.clone()).await,
+                post_binary
+            );
+            assert!(
+                proxy_http_policy_once(post_bad_path, policy.clone())
+                    .await
+                    .is_empty(),
+                "disallowed path must not reach upstream"
+            );
+            assert!(
+                proxy_http_policy_once(get_bad_path, policy.clone())
+                    .await
+                    .is_empty(),
+                "disallowed path must not reach upstream"
+            );
+            assert!(
+                proxy_http_policy_once(delete_denied, policy.clone())
+                    .await
+                    .is_empty(),
+                "disallowed method must not reach upstream"
+            );
+            assert_eq!(
+                proxy_http_policy_once(&pipelined, policy.clone()).await,
+                get_ok,
+                "pipelined denied request must not ride with an allowed prefix"
+            );
+            assert!(
+                proxy_http_policy_once(http2, policy.clone())
+                    .await
+                    .is_empty(),
+                "HTTP/2 preface must fail closed under an L7 allow-list"
+            );
+            assert_eq!(
+                proxy_http_policy_chunks(
+                    vec![get_ok.to_vec(), delete_denied.to_vec()],
+                    policy.clone(),
+                )
+                .await,
+                get_ok,
+                "keep-alive denied method must not reach upstream"
+            );
+        }
+    }
+
+    async fn proxy_http_policy_chunks(chunks: Vec<Vec<u8>>, policy: NetworkPolicy) -> Vec<u8> {
+        let (addr, sink) = spawn_sink().await;
+        let mut policy = policy;
+        if let Some(rule) = policy.rules.first_mut()
+            && rule.ports.len() == 1
+        {
+            rule.ports[0] = PortRange::single(addr.port());
+        }
+        relay_chunks_through_proxy_with_policy(
+            chunks,
+            Arc::new(SharedState::new(4)),
+            Arc::new(policy),
+            SecretsConfig::default(),
+            sink,
+            addr,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unconstrained_policy_forwards_http_and_non_http() {
+        let get = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let ssh = b"SSH-2.0-OpenSSH_9.0\r\n";
+        let policy = NetworkPolicy::allow_all();
+        for _ in 0..2 {
+            assert_eq!(proxy_http_policy_once(get, policy.clone()).await, get);
+            assert_eq!(proxy_http_policy_once(ssh, policy.clone()).await, ssh);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_deny_method_path_allow_classifies_after_connect() {
+        let get_ok = b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let get_bad = b"GET /nope HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let policy = http_method_path_policy(80);
+        assert_eq!(
+            policy.evaluate_egress_with_source(
+                "127.0.0.1:80".parse().unwrap(),
+                Protocol::Tcp,
+                &SharedState::new(4),
+                HostnameSource::Deferred,
+            ),
+            EgressEvaluation::DeferUntilHttp
+        );
+        assert_eq!(proxy_http_policy_once(get_ok, policy.clone()).await, get_ok);
+        assert!(proxy_http_policy_once(get_bad, policy).await.is_empty());
     }
 
     #[test]

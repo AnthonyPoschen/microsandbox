@@ -187,6 +187,17 @@ describe("NetworkPolicyBuilder", () => {
     expect(p.rules[1].destination.group).toBe("private");
   });
 
+  it("method and path filters accumulate on committed rules", () => {
+    const p = NetworkPolicy.builder()
+      .egress((e) =>
+        e.tcp().method("GET").methods(["HEAD", "POST"]).path("/api").paths(["/health"]).allow((d) => d.any()),
+      )
+      .build();
+    expect(p.rules).toHaveLength(1);
+    expect(p.rules[0].methods).toEqual(["GET", "HEAD", "POST"]);
+    expect(p.rules[0].paths).toEqual(["/api", "/health"]);
+  });
+
   it("explicit-ip rule via allow(d => d.ip(...))", () => {
     const p = NetworkPolicy.builder()
       .any((a) => a.deny((d) => d.ip("198.51.100.5")))

@@ -182,11 +182,12 @@ impl TlsProxy {
         }
 
         // Apply Domain / DomainSuffix rules against the SNI.
-        let eval = network_policy.evaluate_egress_with_source(
+        let eval = network_policy.evaluate_egress_http(
             guest_dst,
             Protocol::Tcp,
             &shared,
             HostnameSource::Sni(&sni_name),
+            crate::policy::HttpRequestMatch::NotHttp,
         );
         if !matches!(eval, EgressEvaluation::Allow) {
             tracing::debug!(

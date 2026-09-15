@@ -86,6 +86,8 @@ interface Rule {
   readonly destination: Destination;
   readonly protocols: readonly Protocol[]; // empty = any
   readonly ports: readonly PortRange[];    // empty = any
+  readonly methods?: readonly HttpMethod[]; // empty / omitted = any
+  readonly paths?: readonly string[];       // empty / omitted = any
   readonly action: Action;
 }
 ```
@@ -1087,6 +1089,38 @@ Add an inclusive port range. `lo > hi` records an error surfaced at [`build()`](
     <div className="msb-param-desc">Upper bound (inclusive).</div>
   </div>
 </div>
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">method()</span>
+
+```typescript
+method(method: HttpMethod): this
+```
+
+Add an HTTP method (RFC 9110 plus `PATCH` / `QUERY`). Empty set means any method.
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">methods()</span>
+
+```typescript
+methods(methods: HttpMethod[]): this
+```
+
+Add several HTTP methods.
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">path()</span>
+
+```typescript
+path(path: string): this
+```
+
+Add an HTTP origin-form path. Empty set means any path. Matching is exact after query and fragment are stripped.
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">paths()</span>
+
+```typescript
+paths(paths: string[]): this
+```
+
+Add several HTTP paths.
 
 #### <span className="msb-recv">rule.</span><span className="msb-hn">ports()</span>
 

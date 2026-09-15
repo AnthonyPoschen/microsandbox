@@ -1224,7 +1224,30 @@ type PolicyRule struct {
 	Port string
 	// Ports lets callers pass several values at once.
 	Ports []string
+
+	// Methods is an HTTP method set (empty = any). RFC 9110 methods plus
+	// PATCH and QUERY.
+	Methods []PolicyHttpMethod
+	// Paths is an HTTP origin-form path set (empty = any). Matching is
+	// exact after query and fragment are stripped from the request-target.
+	Paths []string
 }
+
+// PolicyHttpMethod is an HTTP/1 method filter on a PolicyRule.
+type PolicyHttpMethod string
+
+const (
+	PolicyHttpMethodGET     PolicyHttpMethod = "GET"
+	PolicyHttpMethodHEAD    PolicyHttpMethod = "HEAD"
+	PolicyHttpMethodPOST    PolicyHttpMethod = "POST"
+	PolicyHttpMethodPUT     PolicyHttpMethod = "PUT"
+	PolicyHttpMethodDELETE  PolicyHttpMethod = "DELETE"
+	PolicyHttpMethodCONNECT PolicyHttpMethod = "CONNECT"
+	PolicyHttpMethodOPTIONS PolicyHttpMethod = "OPTIONS"
+	PolicyHttpMethodTRACE   PolicyHttpMethod = "TRACE"
+	PolicyHttpMethodPATCH   PolicyHttpMethod = "PATCH"
+	PolicyHttpMethodQUERY   PolicyHttpMethod = "QUERY"
+)
 
 // networkRuleFactory constructs semantic low-level rules shared with the
 // other SDKs.

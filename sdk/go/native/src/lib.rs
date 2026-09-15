@@ -799,6 +799,12 @@ struct NetworkPolicyRule {
     /// Multi-port list. Each entry may be a single port or a range.
     #[serde(default)]
     ports: Vec<serde_json::Value>,
+    /// HTTP methods; empty matches any method.
+    #[serde(default)]
+    methods: Vec<String>,
+    /// HTTP paths; empty matches any path.
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 fn default_egress() -> String {
@@ -1285,12 +1291,15 @@ fn apply_network(
             let destination = parse_destination(r.destination.as_deref())?;
             let protocols = parse_protocols(r.protocol.as_deref(), &r.protocols)?;
             let ports = parse_ports(r.port.as_ref(), &r.ports)?;
+            let methods = parse_http_methods(&r.methods)?;
             rules.push(Rule {
                 action,
                 direction,
                 destination,
                 protocols,
                 ports,
+                methods,
+                paths: r.paths.clone(),
             });
         }
         builder = builder.network(|n| {
@@ -1552,6 +1561,21 @@ fn parse_destination(
 
 /// Merge a single `protocol` shorthand and a `protocols` list into a
 /// dedup'd Vec (empty = any).
+fn parse_http_methods(
+    raw: &[String],
+) -> Result<Vec<microsandbox_network::policy::HttpMethod>, FfiError> {
+    use microsandbox_network::policy::HttpMethod;
+    let mut out = Vec::new();
+    for token in raw {
+        let method = HttpMethod::from_token(token)
+            .ok_or_else(|| FfiError::invalid_argument(format!("unknown HTTP method: {token}")))?;
+        if !out.contains(&method) {
+            out.push(method);
+        }
+    }
+    Ok(out)
+}
+
 fn parse_protocols(
     single: Option<&str>,
     list: &[String],

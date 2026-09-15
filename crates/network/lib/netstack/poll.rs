@@ -405,7 +405,9 @@ pub fn smoltcp_poll_loop(
                                         &shared,
                                         HostnameSource::Deferred,
                                     ),
-                                    EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname
+                                    EgressEvaluation::Allow
+                                        | EgressEvaluation::DeferUntilHostname
+                                        | EgressEvaluation::DeferUntilHttp
                                 )
                         }
                     };

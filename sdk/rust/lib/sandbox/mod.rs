@@ -125,7 +125,7 @@ pub use microsandbox_network::config::{NetworkConfig, PublishedPort};
 pub use microsandbox_network::dns::Nameserver;
 #[cfg(feature = "net")]
 pub use microsandbox_network::policy::{
-    Action as NetworkAction, NetworkPolicy, NetworkProfile, Rule as NetworkRule,
+    Action as NetworkAction, HttpMethod, NetworkPolicy, NetworkProfile, Rule as NetworkRule,
 };
 #[cfg(feature = "net")]
 pub use microsandbox_network::{OutboundProxy, Socks5Credentials};

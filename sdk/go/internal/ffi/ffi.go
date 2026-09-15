@@ -1741,6 +1741,8 @@ type NetworkRule struct {
 	Protocols   []string `json:"protocols,omitempty"`
 	Port        string   `json:"port,omitempty"`
 	Ports       []string `json:"ports,omitempty"`
+	Methods     []string `json:"methods,omitempty"`
+	Paths       []string `json:"paths,omitempty"`
 }
 
 // TLSOptions configures the transparent HTTPS interception proxy.

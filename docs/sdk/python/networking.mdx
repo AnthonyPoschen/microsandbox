@@ -216,6 +216,18 @@ Protocol filter
 
 Single port (`443`) or range (`"8000-9000"`)
 
+#### <span className="msb-recv">rule.</span><span className="msb-hn">methods</span>
+
+`tuple[`[`HttpMethod`](#httpmethod)`, ...]` · Default: `()`
+
+HTTP method set; empty means any method. Evaluated only for plaintext HTTP/1. RFC 9110 methods plus `PATCH` and `QUERY`
+
+#### <span className="msb-recv">rule.</span><span className="msb-hn">paths</span>
+
+`tuple[str, ...]` · Default: `()`
+
+HTTP origin-form path set; empty means any path. Exact match after query and fragment are stripped
+
 Ingress rules carrying ICMP protocols are rejected at sandbox creation; the host has no inbound ICMP path. Use `Direction.EGRESS` for ICMP allow/deny.
 
 A [`NetworkPolicy`](#networkpolicy) is an ordered list of [`Rule`](#rule) values plus two per-direction defaults, evaluated first-match-wins per direction. The class methods below build rules; assemble them into `NetworkPolicy(rules=(...))` and pass it as `Network(policy=...)`.
@@ -260,6 +272,8 @@ def allow(
     protocol: Protocol | None = None,
     port: int | str | None = None,
     destination: str | NetworkDestination | None = None,
+    methods: Iterable[HttpMethod] = (),
+    paths: Iterable[str] = (),
 ) -> Rule
 ```
 
@@ -294,6 +308,14 @@ Create a rule that permits matching traffic. All filters are keyword-only.
     <div className="msb-param-key"><code>destination</code><a className="msb-type" href="#networkdestination">str | NetworkDestination | None</a></div>
     <div className="msb-param-desc">Target filter. Prefer the typed <a className="msb-type" href="#destination">Destination</a> helpers; string shorthand is also accepted.</div>
   </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>methods</code><span className="msb-type">Iterable[HttpMethod]</span></div>
+    <div className="msb-param-desc">HTTP method set. Empty means any method.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>paths</code><span className="msb-type">Iterable[str]</span></div>
+    <div className="msb-param-desc">HTTP origin-form path set. Empty means any path.</div>
+  </div>
 </div>
 
 <p className="msb-label">Returns</p>
@@ -315,6 +337,8 @@ def deny(
     protocol: Protocol | None = None,
     port: int | str | None = None,
     destination: str | NetworkDestination | None = None,
+    methods: Iterable[HttpMethod] = (),
+    paths: Iterable[str] = (),
 ) -> Rule
 ```
 
