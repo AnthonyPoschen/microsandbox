@@ -1091,6 +1091,13 @@ fn next_http1_message_end(buf: &[u8]) -> Option<usize> {
 
 /// Forward complete allowed HTTP/1 messages and drop a following denied
 /// request. `stop` is true when a denied request was encountered.
+///
+/// `classify_first_flight` returns at the first `\r\n\r\n`, so an allowed
+/// POST/PUT may have a Content-Length body that has not arrived yet. In
+/// that case the header block is forwarded and `stop` stays false so the
+/// HTTP stream parser can consume the body from later chunks. Incomplete
+/// bytes with no classifiable header block fail closed only when nothing
+/// has been allowed yet.
 fn take_allowed_http1_prefix(
     policy: &NetworkPolicy,
     guest_dst: SocketAddr,
@@ -1100,16 +1107,25 @@ fn take_allowed_http1_prefix(
     let mut rest = buf;
     let mut allowed = Vec::new();
     while !rest.is_empty() {
-        let Some(end) = next_http1_message_end(rest) else {
-            // Incomplete trailing bytes: do not forward them.
-            return (allowed, true);
+        if let Some(end) = next_http1_message_end(rest) {
+            let (message, tail) = rest.split_at(end);
+            if !http_request_allowed(policy, guest_dst, shared, message, false) {
+                return (allowed, true);
+            }
+            allowed.extend_from_slice(message);
+            rest = tail;
+            continue;
+        }
+
+        let Some(header_end) = http1_header_end(rest) else {
+            let stop = allowed.is_empty();
+            return (allowed, stop);
         };
-        let (message, tail) = rest.split_at(end);
-        if !http_request_allowed(policy, guest_dst, shared, message, false) {
+        if !http_request_allowed(policy, guest_dst, shared, &rest[..header_end], false) {
             return (allowed, true);
         }
-        allowed.extend_from_slice(message);
-        rest = tail;
+        allowed.extend_from_slice(rest);
+        return (allowed, false);
     }
     (allowed, false)
 }
@@ -2309,6 +2325,32 @@ mod tests {
                 .await,
                 get_ok,
                 "keep-alive denied method must not reach upstream"
+            );
+            let post_headers = b"POST /allowed HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+            let post_body = vec![0xff, 0xfe, 0x00, 0x80];
+            let mut post_split = post_headers.to_vec();
+            post_split.extend_from_slice(&post_body);
+            assert_eq!(
+                proxy_http_policy_chunks(
+                    vec![post_headers.to_vec(), post_body.clone()],
+                    policy.clone(),
+                )
+                .await,
+                post_split,
+                "allowed POST headers then body must both reach upstream"
+            );
+            let put_headers = b"PUT /allowed HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+            let put_body = vec![0x01, 0x02, 0x03, 0x04];
+            let mut put_split = put_headers.to_vec();
+            put_split.extend_from_slice(&put_body);
+            assert_eq!(
+                proxy_http_policy_chunks(
+                    vec![put_headers.to_vec(), put_body.clone()],
+                    policy.clone(),
+                )
+                .await,
+                put_split,
+                "allowed PUT headers then body must both reach upstream"
             );
         }
     }
