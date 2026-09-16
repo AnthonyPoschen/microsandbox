@@ -2719,8 +2719,8 @@ pub struct Rule {
     /// Guest-side port-range set; empty matches any port.
     #[serde(default)]
     pub ports: Vec<PortRange>,
-    /// HTTP method set; empty matches any method. Evaluated only when a
-    /// plaintext HTTP/1 request line is available.
+    /// HTTP method set; empty matches any method. Evaluated for plaintext
+    /// HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<HttpMethod>,
     /// HTTP path set; empty matches any path. Exact origin-form path

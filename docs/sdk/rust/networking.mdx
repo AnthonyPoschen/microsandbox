@@ -1347,7 +1347,7 @@ Set semantics; empty = any port
 
 `Vec<`[`HttpMethod`](#httpmethod)`>`
 
-Set semantics; empty = any HTTP method. Evaluated only for plaintext HTTP/1 request lines. RFC 9110 methods plus `PATCH` and `QUERY`. Omitted filters keep SYN-time L4 matching unchanged.
+Set semantics; empty = any HTTP method. Evaluated for plaintext HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception. Encrypted HTTPS without interception cannot match these filters. RFC 9110 methods plus `PATCH` and `QUERY`. Omitted filters keep SYN-time L4 matching unchanged.
 
 #### <span className="msb-recv">Rule::</span><span className="msb-hn">paths</span>
 
@@ -1585,7 +1585,7 @@ ICMP protocols are egress-only. A rule with direction `Ingress` or `Any` carryin
 | `Patch` | `"PATCH"` |
 | `Query` | `"QUERY"` |
 
-Empty `methods` means any HTTP method. Filters apply only to plaintext HTTP/1 request lines.
+Empty `methods` means any HTTP method. Filters apply to plaintext HTTP/1 and to HTTP/1 and HTTP/2 decrypted by TLS interception.
 
 ### Nameserver
 

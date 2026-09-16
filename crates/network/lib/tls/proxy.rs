@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use super::sni;
 use super::state::TlsState;
 use crate::netstack::shared::SharedState;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::{EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::config::ViolationAction;
 use crate::secrets::handler::SecretsHandler;
@@ -181,18 +181,23 @@ impl TlsProxy {
             return Ok(());
         }
 
-        // Apply Domain / DomainSuffix rules against the SNI.
+        // Apply Domain / DomainSuffix rules against the SNI. Method/path
+        // filters cannot be decided from SNI; intercepted connections
+        // defer those until the decrypted request line.
         let eval = network_policy.evaluate_egress_http(
             guest_dst,
             Protocol::Tcp,
             &shared,
             HostnameSource::Sni(&sni_name),
-            crate::policy::HttpRequestMatch::NotHttp,
+            tls_sni_http_context(&network_policy),
         );
-        if !matches!(eval, EgressEvaluation::Allow) {
+        let should_bypass = tls_state.should_bypass(&sni_name);
+        if !tls_sni_eval_permits_connection(eval, should_bypass) {
             tracing::debug!(
                 sni = %sni_name,
                 dst = %guest_dst,
+                bypass = should_bypass,
+                ?eval,
                 "TLS egress denied by domain policy",
             );
             proxy_connect.mark_policy_denied();
@@ -200,7 +205,6 @@ impl TlsProxy {
             return Ok(());
         }
 
-        let should_bypass = tls_state.should_bypass(&sni_name);
         if strict
             && should_bypass
             && network_policy.allows_egress_via_hostname(
@@ -245,6 +249,7 @@ impl TlsProxy {
                 to_smoltcp,
                 shared,
                 tls_state,
+                network_policy,
                 proxy_connect,
                 upstream_stream,
                 outbound_proxy,
@@ -257,6 +262,29 @@ impl TlsProxy {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// HTTP classification used at SNI time. Method/path filters defer
+/// until the request is decrypted; otherwise TLS is not HTTP.
+fn tls_sni_http_context(policy: &NetworkPolicy) -> HttpRequestMatch<'static> {
+    if policy.has_http_filters() {
+        HttpRequestMatch::Unknown
+    } else {
+        HttpRequestMatch::NotHttp
+    }
+}
+
+/// Whether a TLS connection may continue after SNI evaluation.
+///
+/// `DeferUntilHttp` is only safe when the connection will be intercepted
+/// so method/path can be checked on the decrypted request. Bypass cannot
+/// see the request line, so it fails closed.
+fn tls_sni_eval_permits_connection(eval: EgressEvaluation, bypass: bool) -> bool {
+    match eval {
+        EgressEvaluation::Allow => true,
+        EgressEvaluation::DeferUntilHttp => !bypass,
+        EgressEvaluation::Deny | EgressEvaluation::DeferUntilHostname => false,
+    }
+}
 
 /// Bypass mode: plain TCP splice, no TLS termination.
 #[allow(clippy::too_many_arguments)]
@@ -329,6 +357,7 @@ pub(crate) async fn intercept_relay(
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     tls_state: Arc<TlsState>,
+    network_policy: Arc<NetworkPolicy>,
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
@@ -340,7 +369,8 @@ pub(crate) async fn intercept_relay(
     } else {
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
-    .with_guest_dst(guest_dst);
+    .with_guest_dst(guest_dst)
+    .with_http_policy(network_policy, guest_dst, shared.clone());
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -600,4 +630,70 @@ async fn flush_to_guest(
         }
     }
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Action, Destination, Direction, HttpMethod, Protocol, Rule};
+
+    fn method_path_policy() -> NetworkPolicy {
+        NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: Direction::Egress,
+                destination: Destination::Any,
+                protocols: vec![Protocol::Tcp],
+                ports: Vec::new(),
+                methods: vec![HttpMethod::Get],
+                paths: vec!["/allowed".into()],
+                action: Action::Allow,
+            }],
+        }
+    }
+
+    #[test]
+    fn sni_context_defers_when_method_path_filters_exist() {
+        assert_eq!(
+            tls_sni_http_context(&method_path_policy()),
+            HttpRequestMatch::Unknown
+        );
+        assert_eq!(
+            tls_sni_http_context(&NetworkPolicy::allow_all()),
+            HttpRequestMatch::NotHttp
+        );
+    }
+
+    #[test]
+    fn deferred_http_eval_fails_closed_on_tls_bypass() {
+        assert!(tls_sni_eval_permits_connection(
+            EgressEvaluation::Allow,
+            true
+        ));
+        assert!(tls_sni_eval_permits_connection(
+            EgressEvaluation::Allow,
+            false
+        ));
+        assert!(tls_sni_eval_permits_connection(
+            EgressEvaluation::DeferUntilHttp,
+            false
+        ));
+        assert!(!tls_sni_eval_permits_connection(
+            EgressEvaluation::DeferUntilHttp,
+            true
+        ));
+        assert!(!tls_sni_eval_permits_connection(
+            EgressEvaluation::Deny,
+            false
+        ));
+        assert!(!tls_sni_eval_permits_connection(
+            EgressEvaluation::DeferUntilHostname,
+            false
+        ));
+    }
 }

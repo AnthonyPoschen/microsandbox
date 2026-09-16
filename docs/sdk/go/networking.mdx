@@ -436,7 +436,7 @@ A single firewall rule. Ingress rules carrying ICMP protocols are rejected at sa
 | Protocols | `[]`[`PolicyProtocol`](#policyprotocol) | Protocol set. Empty means any |
 | Port | `string` | Single port (`"443"`) or range (`"8000-9000"`) |
 | Ports | `[]string` | Several port values at once |
-| Methods | `[]`[`PolicyHttpMethod`](#policyhttpmethod) | HTTP method set. Empty means any. RFC 9110 methods plus `PATCH` and `QUERY` |
+| Methods | `[]`[`PolicyHttpMethod`](#policyhttpmethod) | HTTP method set. Empty means any. Evaluated for plaintext HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception. RFC 9110 methods plus `PATCH` and `QUERY` |
 | Paths | `[]string` | HTTP origin-form path set. Empty means any. Exact match after query and fragment are stripped |
 
 ### DNSConfig
@@ -712,7 +712,7 @@ The protocol half of a [`PolicyRule`](#policyrule).
 type PolicyHttpMethod string
 ```
 
-HTTP/1 method filter. Empty `Methods` means any method. RFC 9110 methods plus `PATCH` and `QUERY`.
+HTTP method filter. Empty `Methods` means any method. Evaluated for plaintext HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception. RFC 9110 methods plus `PATCH` and `QUERY`.
 
 | Constant | Value |
 |----------|-------|

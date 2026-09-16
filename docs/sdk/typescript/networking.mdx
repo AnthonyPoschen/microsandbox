@@ -1096,7 +1096,7 @@ Add an inclusive port range. `lo > hi` records an error surfaced at [`build()`](
 method(method: HttpMethod): this
 ```
 
-Add an HTTP method (RFC 9110 plus `PATCH` / `QUERY`). Empty set means any method.
+Add an HTTP method (RFC 9110 plus `PATCH` / `QUERY`). Empty set means any method. Evaluated for plaintext HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception.
 
 #### <span className="msb-recv">rule.</span><span className="msb-hn">methods()</span>
 

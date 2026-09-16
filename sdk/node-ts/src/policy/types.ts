@@ -7,7 +7,7 @@ export type Direction = "egress" | "ingress" | "any";
 /** Transport protocol filter. Empty `Rule.protocols` means "any protocol". */
 export type Protocol = "tcp" | "udp" | "icmpv4" | "icmpv6";
 
-/** HTTP/1 method filter. Empty `Rule.methods` means "any method". */
+/** HTTP method filter. Empty `Rule.methods` means "any method". */
 export type HttpMethod =
   | "GET"
   | "HEAD"

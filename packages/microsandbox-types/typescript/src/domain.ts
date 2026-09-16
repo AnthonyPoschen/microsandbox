@@ -155,8 +155,8 @@ export type Rule = {
    */
   ports: Array<PortRange>;
   /**
-   * HTTP method set; empty matches any method. Evaluated only when a
-   * plaintext HTTP/1 request line is available.
+   * HTTP method set; empty matches any method. Evaluated for plaintext
+   * HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception.
    */
   methods?: Array<HttpMethod>;
   /**

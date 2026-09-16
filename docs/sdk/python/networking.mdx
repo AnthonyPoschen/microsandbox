@@ -220,7 +220,7 @@ Single port (`443`) or range (`"8000-9000"`)
 
 `tuple[`[`HttpMethod`](#httpmethod)`, ...]` · Default: `()`
 
-HTTP method set; empty means any method. Evaluated only for plaintext HTTP/1. RFC 9110 methods plus `PATCH` and `QUERY`
+HTTP method set; empty means any method. Evaluated for plaintext HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception. Encrypted HTTPS without interception cannot match these filters. RFC 9110 methods plus `PATCH` and `QUERY`
 
 #### <span className="msb-recv">rule.</span><span className="msb-hn">paths</span>
 

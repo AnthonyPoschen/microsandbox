@@ -17,9 +17,10 @@
 //! [`Rule::protocols`] and [`Rule::ports`] are sets (Vecs); a rule
 //! matches if the packet's protocol is in `protocols` or `protocols` is
 //! empty (any-protocol), and likewise for ports. [`Rule::methods`] and
-//! [`Rule::paths`] are the same idea for plaintext HTTP/1 request lines
-//! (empty = any method / any path) and are only consulted when a
-//! request-target is available.
+//! [`Rule::paths`] are the same idea for HTTP request lines (empty =
+//! any method / any path). They apply to plaintext HTTP/1 and to HTTP/1
+//! and HTTP/2 decrypted by TLS interception, and are only consulted
+//! when a request-target is available.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -115,9 +116,10 @@ pub struct Rule {
     #[serde(default)]
     pub ports: Vec<PortRange>,
 
-    /// HTTP method set (empty = any method). Evaluated only when a
-    /// plaintext HTTP/1 request line is available; skipped at SYN,
-    /// ICMP, DNS, and non-HTTP classification.
+    /// HTTP method set (empty = any method). Evaluated when a plaintext
+    /// HTTP/1 request line is available, or when TLS interception has
+    /// decrypted an HTTP/1 or HTTP/2 request. Skipped at SYN, ICMP,
+    /// DNS, and non-HTTP classification.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<HttpMethod>,
 
@@ -317,8 +319,9 @@ pub enum HttpRequestMatch<'a> {
     /// Handshake or first-flight time: method/path not yet known.
     /// Rules with method/path filters defer instead of matching.
     Unknown,
-    /// Classified as not plaintext HTTP/1. Rules with method/path
-    /// filters are skipped, same as port-filtered rules on ICMP.
+    /// Classified as not HTTP. Rules with method/path filters are
+    /// skipped, same as port-filtered rules on ICMP. Used for TLS
+    /// before interception and for non-HTTP protocols.
     NotHttp,
     /// Parsed HTTP/1 request line.
     Request {
@@ -3198,6 +3201,87 @@ mod tests {
                 &shared,
                 HostnameSource::CacheOnly,
                 HttpRequestMatch::NotHttp,
+            ),
+            EgressEvaluation::Deny
+        );
+    }
+
+    #[test]
+    fn domain_method_path_defers_on_sni_until_request_line() {
+        let shared = shared_with_host("api.example.com", "1.2.3.4");
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: Direction::Egress,
+                destination: Destination::Domain("api.example.com".parse().unwrap()),
+                protocols: vec![Protocol::Tcp],
+                ports: Vec::new(),
+                methods: vec![HttpMethod::Get],
+                paths: vec!["/allowed".to_string()],
+                action: Action::Allow,
+            }],
+        };
+        let dst = sock("1.2.3.4", 443);
+        let sni = HostnameSource::Sni("api.example.com");
+
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                sni,
+                HttpRequestMatch::NotHttp,
+            ),
+            EgressEvaluation::Deny,
+            "treating TLS as NotHttp must not match a method/path allow"
+        );
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                sni,
+                HttpRequestMatch::Unknown,
+            ),
+            EgressEvaluation::DeferUntilHttp
+        );
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                sni,
+                HttpRequestMatch::Request {
+                    method: "GET",
+                    path: "/allowed",
+                },
+            ),
+            EgressEvaluation::Allow
+        );
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                sni,
+                HttpRequestMatch::Request {
+                    method: "POST",
+                    path: "/allowed",
+                },
+            ),
+            EgressEvaluation::Deny
+        );
+        assert_eq!(
+            policy.evaluate_egress_http(
+                dst,
+                Protocol::Tcp,
+                &shared,
+                sni,
+                HttpRequestMatch::Request {
+                    method: "GET",
+                    path: "/denied",
+                },
             ),
             EgressEvaluation::Deny
         );
