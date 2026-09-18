@@ -16,8 +16,9 @@ use percent_encoding::percent_decode;
 use super::config::{
     HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretsConfig, ViolationAction,
 };
+use crate::decision::emit_http;
 use crate::netstack::shared::SharedState;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::{EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -110,6 +111,8 @@ pub struct SecretsHandler {
     unsupported_body_tail: Vec<u8>,
     /// HTTP/2 parser/rewriter state once an HTTP/2 preface is observed.
     http2_state: Option<Http2State>,
+    /// Correlation identifier shared with TCP/TLS events.
+    correlation_id: Option<String>,
 }
 
 /// HTTP request framing state for the guest→server byte stream.
@@ -199,7 +202,14 @@ struct SecretHostIdentity<'a> {
 #[derive(Clone)]
 enum HttpAuthorityValidator {
     /// Require every HTTP authority-bearing field to match this TLS SNI.
-    Sni(String),
+    ///
+    /// When `policy` is set, decrypted HTTP/1 and HTTP/2 requests are
+    /// also evaluated against method/path filters using the SNI as the
+    /// hostname source.
+    Sni {
+        name: String,
+        policy: Option<HttpPolicyContext>,
+    },
     /// Require every HTTP authority-bearing field to be allowed by egress policy.
     Policy {
         guest_dst: SocketAddr,
@@ -208,8 +218,19 @@ enum HttpAuthorityValidator {
     },
 }
 
+/// Egress policy used to evaluate decrypted HTTP method/path filters.
+#[derive(Clone)]
+struct HttpPolicyContext {
+    guest_dst: SocketAddr,
+    network_policy: Arc<NetworkPolicy>,
+    shared: Arc<SharedState>,
+    correlation_id: Option<String>,
+}
+
 /// Parsed HTTP/1 request metadata needed for validation and framing.
 struct HttpRequestMetadata {
+    method: String,
+    path: String,
     host_headers: Vec<String>,
     target_authority: Option<String>,
 }
@@ -515,7 +536,10 @@ impl SecretsHandler {
             sni,
             true,
             Some(SecretHostIdentity { guest_ip, shared }),
-            Some(HttpAuthorityValidator::Sni(sni.to_string())),
+            Some(HttpAuthorityValidator::Sni {
+                name: sni.to_string(),
+                policy: None,
+            }),
             false,
         )
     }
@@ -530,7 +554,10 @@ impl SecretsHandler {
             sni,
             true,
             None,
-            Some(HttpAuthorityValidator::Sni(sni.to_string())),
+            Some(HttpAuthorityValidator::Sni {
+                name: sni.to_string(),
+                policy: None,
+            }),
             false,
         )
     }
@@ -550,7 +577,10 @@ impl SecretsHandler {
             host,
             false,
             Some(SecretHostIdentity { guest_ip, shared }),
-            Some(HttpAuthorityValidator::Sni(host.to_string())),
+            Some(HttpAuthorityValidator::Sni {
+                name: host.to_string(),
+                policy: None,
+            }),
             false,
         )
     }
@@ -691,12 +721,40 @@ impl SecretsHandler {
             http_pending: Vec::new(),
             unsupported_body_tail: Vec::new(),
             http2_state: None,
+            correlation_id: None,
         }
+    }
+
+    /// Attach a correlation identifier for HTTP decision events.
+    pub(crate) fn with_correlation_id(mut self, correlation_id: Option<String>) -> Self {
+        self.correlation_id = correlation_id;
+        self
     }
 
     /// Attach the original guest destination for structured violation logs.
     pub fn with_guest_dst(mut self, guest_dst: SocketAddr) -> Self {
         self.guest_dst = Some(guest_dst);
+        self
+    }
+
+    /// Evaluate decrypted HTTP method/path filters against egress policy.
+    ///
+    /// Host matching still requires the HTTP authority to equal the TLS
+    /// SNI. Method/path evaluation uses that SNI as the hostname source.
+    pub(crate) fn with_http_policy(
+        mut self,
+        network_policy: Arc<NetworkPolicy>,
+        guest_dst: SocketAddr,
+        shared: Arc<SharedState>,
+    ) -> Self {
+        if let Some(HttpAuthorityValidator::Sni { policy, .. }) = &mut self.http_authority {
+            *policy = Some(HttpPolicyContext {
+                guest_dst,
+                network_policy,
+                shared,
+                correlation_id: self.correlation_id.clone(),
+            });
+        }
         self
     }
 
@@ -872,6 +930,13 @@ impl SecretsHandler {
             };
             after_headers.split_at(framing.body_in_request)
         } else {
+            if let Some(HttpAuthorityValidator::Sni {
+                name,
+                policy: Some(ctx),
+            }) = &self.http_authority
+            {
+                evaluate_http_policy(ctx, HostnameSource::Sni(name), HttpRequestMatch::NotHttp)?;
+            }
             (after_headers, &[] as &[u8])
         };
 
@@ -2040,19 +2105,70 @@ fn validate_http1_authority(
     metadata: &HttpRequestMetadata,
     validator: &HttpAuthorityValidator,
 ) -> Result<(), ViolationAction> {
-    if metadata.host_headers.len() != 1 {
-        return Err(ViolationAction::Block);
-    }
+    let http = HttpRequestMatch::Request {
+        method: &metadata.method,
+        path: &metadata.path,
+    };
+    match validator {
+        HttpAuthorityValidator::Sni { .. } => {
+            if metadata.host_headers.len() != 1 {
+                return Err(ViolationAction::Block);
+            }
+            for authority in metadata
+                .host_headers
+                .iter()
+                .chain(metadata.target_authority.iter())
+            {
+                validate_authority(authority, validator, http)?;
+            }
+            Ok(())
+        }
+        HttpAuthorityValidator::Policy {
+            guest_dst,
+            network_policy,
+            shared,
+        } => {
+            if network_policy.has_domain_rules() {
+                if metadata.host_headers.len() != 1 {
+                    return Err(ViolationAction::Block);
+                }
+                for authority in metadata
+                    .host_headers
+                    .iter()
+                    .chain(metadata.target_authority.iter())
+                {
+                    validate_authority(authority, validator, http)?;
+                }
+                return Ok(());
+            }
 
-    for authority in metadata
-        .host_headers
-        .iter()
-        .chain(metadata.target_authority.iter())
-    {
-        validate_authority(authority, validator)?;
+            // Method/path-only rules: classify the request line even when
+            // no Host header is present.
+            let host = metadata
+                .host_headers
+                .first()
+                .and_then(|authority| authority_hostname(authority))
+                .map(str::to_ascii_lowercase);
+            let source = match host.as_deref() {
+                Some(name) => HostnameSource::Sni(name),
+                None => HostnameSource::CacheOnly,
+            };
+            let decision = network_policy.evaluate_egress_http_decision(
+                *guest_dst,
+                Protocol::Tcp,
+                shared,
+                source,
+                http,
+            );
+            emit_http(shared, &decision, *guest_dst, host, None, None);
+            match decision.evaluation {
+                EgressEvaluation::Allow => Ok(()),
+                EgressEvaluation::Deny
+                | EgressEvaluation::DeferUntilHostname
+                | EgressEvaluation::DeferUntilHttp => Err(ViolationAction::Block),
+            }
+        }
     }
-
-    Ok(())
 }
 
 fn validate_http2_authority(
@@ -2061,15 +2177,22 @@ fn validate_http2_authority(
     require_authority: bool,
 ) -> Result<(), ViolationAction> {
     let mut authority_count = 0usize;
+    // Initial HEADERS carry :method/:path; trailers must not re-run L7
+    // filters with `NotHttp` (that would skip method/path allows).
+    let http = if require_authority {
+        http2_request_match(headers)
+    } else {
+        HttpRequestMatch::NotHttp
+    };
 
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b":authority") {
             authority_count += 1;
             let authority = String::from_utf8_lossy(value);
-            validate_authority(authority.as_ref(), validator)?;
+            validate_authority(authority.as_ref(), validator, http)?;
         } else if name.eq_ignore_ascii_case(b"host") {
             let host = String::from_utf8_lossy(value);
-            validate_authority(host.as_ref(), validator)?;
+            validate_authority(host.as_ref(), validator, http)?;
         }
     }
 
@@ -2077,17 +2200,96 @@ fn validate_http2_authority(
         return Err(ViolationAction::Block);
     }
 
+    // Initial HTTP/2 without :method/:path cannot satisfy a method/path
+    // allow. Evaluate as NotHttp so those rules are skipped.
+    if require_authority
+        && matches!(http, HttpRequestMatch::NotHttp)
+        && let HttpAuthorityValidator::Sni {
+            name,
+            policy: Some(ctx),
+        } = validator
+    {
+        evaluate_http_policy(ctx, HostnameSource::Sni(name), http)?;
+    }
+
     Ok(())
+}
+
+fn http2_request_match(headers: &[(Vec<u8>, Vec<u8>)]) -> HttpRequestMatch<'_> {
+    let mut method = None;
+    let mut path = None;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(b":method") {
+            method = std::str::from_utf8(value).ok();
+        } else if name.eq_ignore_ascii_case(b":path") {
+            path = std::str::from_utf8(value).ok();
+        }
+    }
+    match (method, path) {
+        (Some(method), Some(path)) => HttpRequestMatch::Request {
+            method,
+            path: crate::policy::normalize_http_path(path),
+        },
+        _ => HttpRequestMatch::NotHttp,
+    }
+}
+
+fn evaluate_http_policy(
+    ctx: &HttpPolicyContext,
+    source: HostnameSource<'_>,
+    http: HttpRequestMatch<'_>,
+) -> Result<(), ViolationAction> {
+    let decision = ctx.network_policy.evaluate_egress_http_decision(
+        ctx.guest_dst,
+        Protocol::Tcp,
+        &ctx.shared,
+        source,
+        http,
+    );
+    let authority = match source {
+        HostnameSource::Sni(name) => Some(name.to_string()),
+        HostnameSource::CacheOnly | HostnameSource::Deferred => None,
+    };
+    emit_http(
+        &ctx.shared,
+        &decision,
+        ctx.guest_dst,
+        authority.clone(),
+        authority,
+        ctx.correlation_id.clone(),
+    );
+    match decision.evaluation {
+        EgressEvaluation::Allow => Ok(()),
+        EgressEvaluation::Deny
+        | EgressEvaluation::DeferUntilHostname
+        | EgressEvaluation::DeferUntilHttp => {
+            tracing::debug!(
+                dst = %ctx.guest_dst,
+                "HTTP request denied by method/path policy",
+            );
+            Err(ViolationAction::Block)
+        }
+    }
 }
 
 fn validate_authority(
     authority: &str,
     validator: &HttpAuthorityValidator,
+    http: HttpRequestMatch<'_>,
 ) -> Result<(), ViolationAction> {
     match validator {
-        HttpAuthorityValidator::Sni(sni) => authority_matches_sni(authority, sni)
-            .then_some(())
-            .ok_or(ViolationAction::Block),
+        HttpAuthorityValidator::Sni { name, policy } => {
+            if !authority_matches_sni(authority, name) {
+                return Err(ViolationAction::Block);
+            }
+            // Method/path is only applied when we have a parsed request
+            // line. Trailers re-enter this path with `NotHttp` and must
+            // not re-evaluate L7 filters.
+            if let (Some(ctx), HttpRequestMatch::Request { .. }) = (policy, http) {
+                evaluate_http_policy(ctx, HostnameSource::Sni(name), http)?;
+            }
+            Ok(())
+        }
         HttpAuthorityValidator::Policy {
             guest_dst,
             network_policy,
@@ -2098,16 +2300,26 @@ fn validate_authority(
             };
             let hostname = hostname.to_ascii_lowercase();
             let authority_dst = SocketAddr::new(guest_dst.ip(), guest_dst.port());
-            match network_policy.evaluate_egress_with_source(
+            let decision = network_policy.evaluate_egress_http_decision(
                 authority_dst,
                 Protocol::Tcp,
                 shared,
                 HostnameSource::Sni(&hostname),
-            ) {
+                http,
+            );
+            emit_http(
+                shared,
+                &decision,
+                authority_dst,
+                Some(hostname.clone()),
+                None,
+                None,
+            );
+            match decision.evaluation {
                 EgressEvaluation::Allow => Ok(()),
-                EgressEvaluation::Deny | EgressEvaluation::DeferUntilHostname => {
-                    Err(ViolationAction::Block)
-                }
+                EgressEvaluation::Deny
+                | EgressEvaluation::DeferUntilHostname
+                | EgressEvaluation::DeferUntilHttp => Err(ViolationAction::Block),
             }
         }
     }
@@ -2163,11 +2375,9 @@ fn parse_http_request_metadata(
         }
     }
 
-    if host_headers.is_empty() {
-        return Err(ViolationAction::Block);
-    }
-
     Ok(Some(HttpRequestMetadata {
+        method: method.to_string(),
+        path: crate::policy::normalize_http_path(target).to_string(),
         host_headers,
         target_authority,
     }))
@@ -3145,9 +3355,10 @@ impl SecretViolationReport {
 mod tests {
     use super::*;
     use crate::netstack::shared::{ResolvedHostnameFamily, SharedState};
+    use crate::policy::{Action, Destination, Direction, HttpMethod, Rule};
     use crate::secrets::config::*;
 
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     fn make_config(secrets: Vec<SecretEntry>) -> SecretsConfig {
@@ -5408,5 +5619,178 @@ mod tests {
             b"GET /b HTTP/1.1\r\nHost: example.com\r\nAuth: real-secret\r\n\r\n",
         );
         assert_eq!(out3.as_ref(), expected.as_slice());
+    }
+
+    fn domain_method_path_policy(host: &str) -> NetworkPolicy {
+        NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: Direction::Egress,
+                destination: Destination::Domain(host.parse().unwrap()),
+                protocols: vec![Protocol::Tcp],
+                ports: Vec::new(),
+                methods: vec![HttpMethod::Get, HttpMethod::Head],
+                paths: vec!["/allowed".to_string()],
+                action: Action::Allow,
+            }],
+        }
+    }
+
+    fn tls_handler_with_http_policy(sni: &str, ip: Ipv4Addr) -> SecretsHandler {
+        let shared = Arc::new(SharedState::new(16));
+        cache_host(shared.as_ref(), sni, ip);
+        let dst = SocketAddr::new(IpAddr::V4(ip), 443);
+        SecretsHandler::new_tls_intercepted(
+            &SecretsConfig::default(),
+            sni,
+            IpAddr::V4(ip),
+            shared.as_ref(),
+        )
+        .with_guest_dst(dst)
+        .with_http_policy(Arc::new(domain_method_path_policy(sni)), dst, shared)
+    }
+
+    #[test]
+    fn tls_intercepted_http1_enforces_method_and_path() {
+        let ip = Ipv4Addr::new(203, 0, 113, 80);
+        let mut handler = tls_handler_with_http_policy("api.example.com", ip);
+
+        let allowed = b"GET /allowed HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert_eq!(handler.substitute(allowed).unwrap().as_ref(), allowed);
+
+        let allowed_query = b"GET /allowed?x=1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert_eq!(
+            handler.substitute(allowed_query).unwrap().as_ref(),
+            allowed_query
+        );
+
+        let bad_path = b"GET /denied HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert_eq!(
+            handler.substitute(bad_path).unwrap_err(),
+            ViolationAction::Block
+        );
+
+        let mut handler = tls_handler_with_http_policy("api.example.com", ip);
+        let bad_method =
+            b"POST /allowed HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            handler.substitute(bad_method).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn tls_intercepted_http1_keep_alive_blocks_later_denied_request() {
+        let ip = Ipv4Addr::new(203, 0, 113, 81);
+        let mut handler = tls_handler_with_http_policy("api.example.com", ip);
+        let allowed = b"GET /allowed HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert_eq!(handler.substitute(allowed).unwrap().as_ref(), allowed);
+
+        let denied = b"GET /denied HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert_eq!(
+            handler.substitute(denied).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn tls_intercepted_non_http_fails_closed_under_method_path_allow() {
+        let ip = Ipv4Addr::new(203, 0, 113, 82);
+        let mut handler = tls_handler_with_http_policy("api.example.com", ip);
+        assert_eq!(
+            handler.substitute(b"SSH-2.0-OpenSSH_9.0\r\n").unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn tls_intercepted_http2_enforces_method_and_path() {
+        let ip = Ipv4Addr::new(203, 0, 113, 83);
+        let mut handler = tls_handler_with_http_policy("api.example.com", ip);
+
+        let allowed = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/allowed?x=1"),
+            ],
+            true,
+        );
+        assert!(handler.substitute(&allowed).is_ok());
+
+        let mut handler = tls_handler_with_http_policy("api.example.com", ip);
+        let bad_path = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/denied"),
+            ],
+            true,
+        );
+        assert_eq!(
+            handler.substitute(&bad_path).unwrap_err(),
+            ViolationAction::Block
+        );
+
+        let mut handler = tls_handler_with_http_policy("api.example.com", ip);
+        let bad_method = h2_request(
+            &[
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/allowed"),
+            ],
+            true,
+        );
+        assert_eq!(
+            handler.substitute(&bad_method).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn tls_intercepted_host_only_allow_still_forwards_when_other_rules_have_filters() {
+        let ip = Ipv4Addr::new(203, 0, 113, 84);
+        let shared = Arc::new(SharedState::new(16));
+        cache_host(shared.as_ref(), "api.example.com", ip);
+        let dst = SocketAddr::new(IpAddr::V4(ip), 443);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule {
+                    direction: Direction::Egress,
+                    destination: Destination::Domain("api.example.com".parse().unwrap()),
+                    protocols: vec![Protocol::Tcp],
+                    ports: Vec::new(),
+                    methods: Vec::new(),
+                    paths: Vec::new(),
+                    action: Action::Allow,
+                },
+                Rule {
+                    direction: Direction::Egress,
+                    destination: Destination::Any,
+                    protocols: vec![Protocol::Tcp],
+                    ports: Vec::new(),
+                    methods: vec![HttpMethod::Get],
+                    paths: vec!["/other".to_string()],
+                    action: Action::Allow,
+                },
+            ],
+        };
+        let mut handler = SecretsHandler::new_tls_intercepted(
+            &SecretsConfig::default(),
+            "api.example.com",
+            IpAddr::V4(ip),
+            shared.as_ref(),
+        )
+        .with_guest_dst(dst)
+        .with_http_policy(Arc::new(policy), dst, shared);
+
+        let post = b"POST /anything HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(handler.substitute(post).unwrap().as_ref(), post);
     }
 }

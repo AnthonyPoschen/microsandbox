@@ -2,7 +2,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use microsandbox_network::policy::{
-    Action as RustAction, DestinationGroup as RustDestinationGroup,
+    Action as RustAction, DestinationGroup as RustDestinationGroup, HttpMethod as RustHttpMethod,
     NetworkPolicy as RustNetworkPolicy, NetworkPolicyBuilder as RustNetworkPolicyBuilder,
     RuleBuilder as RustRuleBuilder,
 };
@@ -73,6 +73,10 @@ enum RuleOp {
     Port(u16),
     PortRange(u16, u16),
     Ports(Vec<u16>),
+    Method(RustHttpMethod),
+    Methods(Vec<RustHttpMethod>),
+    Path(String),
+    Paths(Vec<String>),
     AllowGroup(RustDestinationGroup),
     DenyGroup(RustDestinationGroup),
     AllowLocal,
@@ -324,6 +328,38 @@ impl JsRuleBuilder {
         }
         self.ops.push(RuleOp::Ports(converted));
         Ok(self)
+    }
+
+    /// Add an HTTP method (RFC 9110 plus `PATCH` / `QUERY`).
+    #[napi]
+    pub fn method(&mut self, method: String) -> Result<&Self> {
+        self.ops.push(RuleOp::Method(parse_http_method(&method)?));
+        Ok(self)
+    }
+
+    /// Add several HTTP methods.
+    #[napi]
+    pub fn methods(&mut self, methods: Vec<String>) -> Result<&Self> {
+        let mut parsed = Vec::with_capacity(methods.len());
+        for method in methods {
+            parsed.push(parse_http_method(&method)?);
+        }
+        self.ops.push(RuleOp::Methods(parsed));
+        Ok(self)
+    }
+
+    /// Add an HTTP origin-form path to the path set.
+    #[napi]
+    pub fn path(&mut self, path: String) -> &Self {
+        self.ops.push(RuleOp::Path(path));
+        self
+    }
+
+    /// Add several HTTP paths.
+    #[napi]
+    pub fn paths(&mut self, paths: Vec<String>) -> &Self {
+        self.ops.push(RuleOp::Paths(paths));
+        self
     }
 
     // -- atomic group shortcuts --------------------------------------
@@ -608,6 +644,8 @@ pub struct NetworkPolicyRule {
     pub destination: NetworkPolicyDestination,
     pub protocols: Vec<String>,
     pub ports: Vec<NetworkPolicyPortRange>,
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
     pub action: String,
 }
 
@@ -665,6 +703,18 @@ fn apply_rule_ops(rb: &mut RustRuleBuilder, ops: Vec<RuleOp>) -> &mut RustRuleBu
             }
             RuleOp::Ports(ports) => {
                 rb.ports(ports);
+            }
+            RuleOp::Method(method) => {
+                rb.method(method);
+            }
+            RuleOp::Methods(methods) => {
+                rb.methods(methods);
+            }
+            RuleOp::Path(path) => {
+                rb.path(path);
+            }
+            RuleOp::Paths(paths) => {
+                rb.paths(paths);
             }
             RuleOp::AllowGroup(g) => {
                 apply_group_shortcut(rb, RustAction::Allow, g);
@@ -779,6 +829,14 @@ fn parse_action(s: &str) -> Result<RustAction> {
     }
 }
 
+fn parse_http_method(s: &str) -> Result<RustHttpMethod> {
+    RustHttpMethod::from_token(s).ok_or_else(|| {
+        napi::Error::from_reason(format!(
+            "unknown HTTP method `{s}` (expected GET | HEAD | POST | PUT | DELETE | CONNECT | OPTIONS | TRACE | PATCH | QUERY)"
+        ))
+    })
+}
+
 fn parse_group(s: &str) -> Result<RustDestinationGroup> {
     match s {
         "public" => Ok(RustDestinationGroup::Public),
@@ -876,6 +934,12 @@ fn rust_policy_to_js(p: RustNetworkPolicy) -> NetworkPolicy {
                     end: pr.end as u32,
                 })
                 .collect(),
+            methods: r
+                .methods
+                .into_iter()
+                .map(|m| m.as_str().to_string())
+                .collect(),
+            paths: r.paths,
             action: action_to_str(r.action),
         })
         .collect();

@@ -7,6 +7,8 @@ const allowEgressRule = (destination: Types.Destination): Types.Rule => ({
   destination,
   protocols: empty,
   ports: empty,
+  methods: empty,
+  paths: empty,
   action: "allow",
 });
 

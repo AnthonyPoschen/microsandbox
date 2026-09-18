@@ -2719,8 +2719,46 @@ pub struct Rule {
     /// Guest-side port-range set; empty matches any port.
     #[serde(default)]
     pub ports: Vec<PortRange>,
+    /// HTTP method set; empty matches any method. Evaluated for plaintext
+    /// HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<HttpMethod>,
+    /// HTTP path set; empty matches any path. Exact origin-form path
+    /// match with query and fragment stripped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     /// Action to take on a match.
     pub action: Action,
+}
+
+/// HTTP/1 method filter for [`Rule::methods`].
+///
+/// RFC 9110 methods plus the common extensions `PATCH` and `QUERY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    /// RFC 9110 `GET`.
+    Get,
+    /// RFC 9110 `HEAD`.
+    Head,
+    /// RFC 9110 `POST`.
+    Post,
+    /// RFC 9110 `PUT`.
+    Put,
+    /// RFC 9110 `DELETE`.
+    Delete,
+    /// RFC 9110 `CONNECT`.
+    Connect,
+    /// RFC 9110 `OPTIONS`.
+    Options,
+    /// RFC 9110 `TRACE`.
+    Trace,
+    /// RFC 5789 `PATCH`.
+    Patch,
+    /// RFC 9727 `QUERY`.
+    Query,
 }
 
 /// Egress/ingress network policy: an ordered [`Rule`] list plus a

@@ -20,6 +20,9 @@ use microsandbox_types::{
 use msb_krun::backends::net::NetBackend;
 
 use crate::config::{MAX_NETWORK_CONNECTIONS, ResolvedNetworkConfig};
+use crate::decision::{
+    DEFAULT_DECISION_BUFFER_CAPACITY, DecisionHandle, clamp_decision_buffer_capacity,
+};
 use crate::netstack::{
     backend::SmoltcpBackend,
     poll::{self, GatewayIps, PollLoopConfig},
@@ -173,7 +176,28 @@ impl SmoltcpNetwork {
         slot: u16,
         deployment_profile: DeploymentProfile,
     ) -> Result<Self, NetworkInitError> {
-        Self::build(config, slot, deployment_profile, HostRoutes::detect())
+        Self::new_with_decision_capacity(
+            config,
+            slot,
+            deployment_profile,
+            DEFAULT_DECISION_BUFFER_CAPACITY,
+        )
+    }
+
+    /// Create the network backend with an explicit decision-log capacity.
+    pub fn new_with_decision_capacity(
+        config: ResolvedNetworkConfig,
+        slot: u16,
+        deployment_profile: DeploymentProfile,
+        decision_capacity: usize,
+    ) -> Result<Self, NetworkInitError> {
+        Self::build(
+            config,
+            slot,
+            deployment_profile,
+            HostRoutes::detect(),
+            decision_capacity,
+        )
     }
 
     fn build(
@@ -181,6 +205,7 @@ impl SmoltcpNetwork {
         slot: u16,
         deployment_profile: DeploymentProfile,
         host_routes: HostRoutes,
+        decision_capacity: usize,
     ) -> Result<Self, NetworkInitError> {
         enforce_deployment_profile(&mut config, deployment_profile);
         let platform_policy = Self::platform_policy(deployment_profile);
@@ -232,7 +257,10 @@ impl SmoltcpNetwork {
             .max_connections
             .unwrap_or(DEFAULT_QUEUE_CAPACITY)
             .max(DEFAULT_QUEUE_CAPACITY);
-        let shared = Arc::new(SharedState::new(queue_capacity));
+        let shared = Arc::new(SharedState::with_decision_capacity(
+            queue_capacity,
+            clamp_decision_buffer_capacity(decision_capacity),
+        ));
         // Every write path validates rate limiters (`NetworkBuilder::build`),
         // but a stored config bypasses the builder: fail startup cleanly
         // instead of panicking on a corrupted spec.
@@ -494,6 +522,11 @@ impl SmoltcpNetwork {
     /// updates without restarting the sandbox.
     pub fn secrets_handle(&self) -> SecretsHandle {
         self.secrets.clone()
+    }
+
+    /// Handle for reading and following network-policy decisions.
+    pub fn decision_handle(&self) -> DecisionHandle {
+        self.shared.decisions().clone()
     }
 }
 
@@ -887,6 +920,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(true, false),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
         let vars = net.guest_env_vars();
@@ -907,6 +941,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(true, true),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
         let vars = net.guest_env_vars();
@@ -926,6 +961,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(true, false),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
         let vars = net.guest_env_vars();
@@ -940,6 +976,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(false, true),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
         let vars = net.guest_env_vars();
@@ -959,6 +996,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(true, false),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
         let vars = net.guest_env_vars();
@@ -977,6 +1015,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(false, false),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
         let vars = net.guest_env_vars();
@@ -993,6 +1032,7 @@ mod tests {
             7,
             DeploymentProfile::SingleTenant,
             routes(true, true),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
 
@@ -1013,6 +1053,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(false, false),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         )
         .unwrap();
 
@@ -1035,6 +1076,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(true, false),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         ) {
             Ok(_) => panic!("excessive max_connections should fail"),
             Err(err) => err,
@@ -1070,6 +1112,7 @@ mod tests {
             0,
             DeploymentProfile::SingleTenant,
             routes(true, false),
+            DEFAULT_DECISION_BUFFER_CAPACITY,
         ) {
             Ok(_) => panic!("empty rate limiter should fail"),
             Err(err) => err,

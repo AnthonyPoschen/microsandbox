@@ -29,6 +29,8 @@ sb, err := m.CreateSandbox(ctx, "worker",
 
 Set the network configuration for the sandbox. Pass a profile policy from the [`NetworkPolicy`](#networkpolicy) factory, or a custom [`NetworkConfig`](#networkconfig) value with your own rules, DNS, TLS, and port settings.
 
+Running sandboxes expose structured enforcement events through [`Sandbox.NetworkDecisions`](#m-networkdecisions) and [`Sandbox.NetworkDecisionStream`](#m-networkdecisionstream). Events cover DNS, TCP, UDP, TLS/SNI, and HTTP policy decisions. Bodies, credentials, cookies, and TLS private material are never included.
+
 <p className="msb-label">Parameters</p>
 
 <div className="msb-params">
@@ -420,6 +422,8 @@ type PolicyRule struct {
     Protocols   []PolicyProtocol
     Port        string
     Ports       []string
+    Methods     []PolicyHttpMethod
+    Paths       []string
 }
 ```
 
@@ -434,6 +438,8 @@ A single firewall rule. Ingress rules carrying ICMP protocols are rejected at sa
 | Protocols | `[]`[`PolicyProtocol`](#policyprotocol) | Protocol set. Empty means any |
 | Port | `string` | Single port (`"443"`) or range (`"8000-9000"`) |
 | Ports | `[]string` | Several port values at once |
+| Methods | `[]`[`PolicyHttpMethod`](#policyhttpmethod) | HTTP method set. Empty means any. Evaluated for plaintext HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception. RFC 9110 methods plus `PATCH` and `QUERY` |
+| Paths | `[]string` | HTTP origin-form path set. Empty means any. Exact match after query and fragment are stripped |
 
 ### DNSConfig
 
@@ -700,6 +706,29 @@ The protocol half of a [`PolicyRule`](#policyrule).
 | `PolicyProtocolICMPv4` | `"icmpv4"` | ICMPv4 traffic (egress only) |
 | `PolicyProtocolICMPv6` | `"icmpv6"` | ICMPv6 traffic (egress only) |
 
+### PolicyHttpMethod
+
+<p className="msb-backref">Used by <a href="#policyrule">PolicyRule.Methods</a></p>
+
+```go
+type PolicyHttpMethod string
+```
+
+HTTP method filter. Empty `Methods` means any method. Evaluated for plaintext HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception. RFC 9110 methods plus `PATCH` and `QUERY`.
+
+| Constant | Value |
+|----------|-------|
+| `PolicyHttpMethodGET` | `"GET"` |
+| `PolicyHttpMethodHEAD` | `"HEAD"` |
+| `PolicyHttpMethodPOST` | `"POST"` |
+| `PolicyHttpMethodPUT` | `"PUT"` |
+| `PolicyHttpMethodDELETE` | `"DELETE"` |
+| `PolicyHttpMethodCONNECT` | `"CONNECT"` |
+| `PolicyHttpMethodOPTIONS` | `"OPTIONS"` |
+| `PolicyHttpMethodTRACE` | `"TRACE"` |
+| `PolicyHttpMethodPATCH` | `"PATCH"` |
+| `PolicyHttpMethodQUERY` | `"QUERY"` |
+
 ### NetworkProfile
 
 ```go
@@ -713,3 +742,22 @@ Composable profile names accepted by [`NetworkPolicy.FromProfiles()`](#networkpo
 | `NetworkProfilePublic` | `"public"` | Public internet addresses |
 | `NetworkProfilePrivate` | `"private"` | Private/LAN ranges |
 | `NetworkProfileHost` | `"host"` | Sandbox host gateway addresses |
+
+## Observing policy decisions
+
+Every DNS, TCP, UDP, TLS/SNI, and HTTP enforcement decision is recorded in a bounded per-sandbox ring buffer. Replay it with `Sandbox.NetworkDecisions`, or follow live events with `Sandbox.NetworkDecisionStream`. `Recv` returns `nil, nil` at end-of-stream (snapshot drained or sandbox stopped). Events never include request bodies, credentials, cookies, or TLS private material.
+
+```go
+snap, err := sb.NetworkDecisions(ctx, m.NetworkDecisionOptions{})
+stream, err := sb.NetworkDecisionStream(ctx, m.NetworkDecisionOptions{Follow: true})
+defer stream.Close()
+for {
+    ev, err := stream.Recv(ctx)
+    if ev == nil {
+        break
+    }
+    fmt.Println(ev.Phase, ev.Action, ev.Reason, ev.Sequence)
+}
+```
+
+Capacity is configured in host runtime configuration as `runtime.network_decision_buffer_capacity` (default 4096). Wrapped events increment `dropped_count` rather than disappearing silently.

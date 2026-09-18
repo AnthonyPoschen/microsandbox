@@ -1094,6 +1094,10 @@ export interface NapiRuleBuilder {
   port(port: number): this;
   portRange(lo: number, hi: number): this;
   ports(ports: number[]): this;
+  method(method: string): this;
+  methods(methods: string[]): this;
+  path(path: string): this;
+  paths(paths: string[]): this;
   allowPublic(): this;
   denyPublic(): this;
   allowPrivate(): this;
@@ -1142,6 +1146,8 @@ export interface NapiBuiltNetworkPolicyRule {
   readonly destination: NapiBuiltNetworkPolicyDestination;
   readonly protocols: readonly string[];
   readonly ports: readonly { readonly start: number; readonly end: number }[];
+  readonly methods: readonly string[];
+  readonly paths: readonly string[];
   readonly action: string;
 }
 

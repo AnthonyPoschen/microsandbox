@@ -2470,6 +2470,8 @@ fn sandbox_cli_args(
         vsock: config.spec.vsock.routes.clone(),
         #[cfg(feature = "net")]
         deployment_profile: config.spec.deployment_profile,
+        #[cfg(feature = "net")]
+        network_decision_buffer_capacity: local.config().runtime.network_decision_buffer_capacity,
         bootstrap: GuestBootstrap {
             hostname: Some(
                 config.spec.runtime.hostname.clone().unwrap_or_else(|| {

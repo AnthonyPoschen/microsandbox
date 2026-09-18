@@ -48,6 +48,7 @@ use super::nameserver::read_host_dns_servers;
 use super::nameserver::resolve_nameservers;
 #[cfg(windows)]
 use super::windows_resolver::WindowsSystemResolver;
+use crate::decision::emit_dns;
 use crate::netstack::{
     poll::GatewayIps,
     shared::{ResolvedHostnameFamily, SharedState},
@@ -290,7 +291,19 @@ impl DnsForwarder {
         // as egress over the guest-facing DNS transport, so deny-by-
         // default policies fail closed unless a rule allows the name or
         // the DNS protocol/port.
-        if decide_dns_action(&self.network_policy, &domain, transport).is_deny() {
+        let (dns_action, matched_rule) =
+            decide_dns_action(&self.network_policy, &domain, transport);
+        let correlation_id = self.shared.next_correlation_id("dns");
+        emit_dns(
+            self.shared.decisions(),
+            dns_action,
+            matched_rule,
+            Some(domain.clone()),
+            transport.policy_protocol(),
+            transport.upstream_port(),
+            Some(correlation_id),
+        );
+        if dns_action.is_deny() {
             tracing::debug!(domain = %domain, "DNS query denied by network policy");
             // NXDOMAIN, not REFUSED: stub resolvers (e.g. glibc) don't
             // fail-fast on REFUSED, so a denied lookup hangs the guest in a
@@ -831,14 +844,19 @@ fn decide_upstream_with_platform(
 /// function — no I/O — so the denial logic is testable without a real
 /// upstream client. Names that don't parse as a [`DomainName`] take the
 /// nameless path, where only `Any` rules can match.
-fn decide_dns_action(policy: &NetworkPolicy, domain: &str, transport: Transport) -> Action {
+fn decide_dns_action(
+    policy: &NetworkPolicy,
+    domain: &str,
+    transport: Transport,
+) -> (Action, String) {
     match domain.parse::<DomainName>() {
-        Ok(canonical) => policy.evaluate_dns_query(
-            &canonical,
+        Ok(canonical) => policy.evaluate_dns_query_decision(
+            Some(&canonical),
             transport.policy_protocol(),
             transport.upstream_port(),
         ),
-        Err(_) => policy.evaluate_dns_query_without_name(
+        Err(_) => policy.evaluate_dns_query_decision(
+            None,
             transport.policy_protocol(),
             transport.upstream_port(),
         ),
@@ -1342,6 +1360,8 @@ mod tests {
                 destination: Destination::Cidr("10.20.30.40/32".parse().unwrap()),
                 protocols: Vec::new(),
                 ports: Vec::new(),
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Deny,
             },
         );
@@ -1709,6 +1729,8 @@ mod tests {
                 destination: Destination::Cidr("8.8.8.8/32".parse().unwrap()),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Deny,
             }],
         };
@@ -1762,6 +1784,8 @@ mod tests {
                 destination: Destination::Cidr("1.1.1.1/32".parse().unwrap()),
                 protocols: vec![Protocol::Tcp],
                 ports: vec![],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Deny,
             }],
         };
@@ -1780,7 +1804,7 @@ mod tests {
     fn decide_dns_action_allows_under_default_allow() {
         let policy = NetworkPolicy::allow_all();
         assert_eq!(
-            decide_dns_action(&policy, "example.com", Transport::Udp),
+            decide_dns_action(&policy, "example.com", Transport::Udp).0,
             Action::Allow
         );
     }
@@ -1792,15 +1816,15 @@ mod tests {
         // egress evaluation was added for.
         let policy = NetworkPolicy::none();
         assert_eq!(
-            decide_dns_action(&policy, "example.com", Transport::Udp),
+            decide_dns_action(&policy, "example.com", Transport::Udp).0,
             Action::Deny
         );
         assert_eq!(
-            decide_dns_action(&policy, "example.com", Transport::Tcp),
+            decide_dns_action(&policy, "example.com", Transport::Tcp).0,
             Action::Deny
         );
         assert_eq!(
-            decide_dns_action(&policy, "example.com", Transport::Dot),
+            decide_dns_action(&policy, "example.com", Transport::Dot).0,
             Action::Deny
         );
     }
@@ -1818,15 +1842,17 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Udp],
                 ports: vec![PortRange::single(53)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
         assert_eq!(
-            decide_dns_action(&policy, "example.com", Transport::Udp),
+            decide_dns_action(&policy, "example.com", Transport::Udp).0,
             Action::Allow
         );
         assert_eq!(
-            decide_dns_action(&policy, "example.com", Transport::Tcp),
+            decide_dns_action(&policy, "example.com", Transport::Tcp).0,
             Action::Deny
         );
     }
@@ -1844,11 +1870,13 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(853)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
         assert_eq!(
-            decide_dns_action(&policy_853, "example.com", Transport::Dot),
+            decide_dns_action(&policy_853, "example.com", Transport::Dot).0,
             Action::Allow
         );
 
@@ -1860,11 +1888,13 @@ mod tests {
                 destination: Destination::Any,
                 protocols: vec![Protocol::Tcp],
                 ports: vec![PortRange::single(53)],
+                methods: Vec::new(),
+                paths: Vec::new(),
                 action: Action::Allow,
             }],
         };
         assert_eq!(
-            decide_dns_action(&policy_53, "example.com", Transport::Dot),
+            decide_dns_action(&policy_53, "example.com", Transport::Dot).0,
             Action::Deny
         );
     }
@@ -1881,14 +1911,14 @@ mod tests {
         // parsing rejects it; the nameless path falls through to the
         // default (allow_all → Allow).
         assert_eq!(
-            decide_dns_action(&policy, "", Transport::Udp),
+            decide_dns_action(&policy, "", Transport::Udp).0,
             Action::Allow
         );
 
         // Under deny-by-default, an unparseable name with no Any rule is
         // denied.
         let deny = NetworkPolicy::none();
-        assert_eq!(decide_dns_action(&deny, "", Transport::Udp), Action::Deny);
+        assert_eq!(decide_dns_action(&deny, "", Transport::Udp).0, Action::Deny);
     }
 
     #[test]
@@ -1897,11 +1927,11 @@ mod tests {
             .deny_domain("evil.com")
             .expect("valid name");
         assert_eq!(
-            decide_dns_action(&policy, "evil.com", Transport::Udp),
+            decide_dns_action(&policy, "evil.com", Transport::Udp).0,
             Action::Deny
         );
         assert_eq!(
-            decide_dns_action(&policy, "good.com", Transport::Udp),
+            decide_dns_action(&policy, "good.com", Transport::Udp).0,
             Action::Allow
         );
     }

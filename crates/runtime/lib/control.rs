@@ -63,6 +63,25 @@ pub enum ControlRequest {
         /// Ordered changes to apply. The first failure aborts the batch.
         changes: Vec<SecretLiveChange>,
     },
+
+    /// Replay buffered network-policy decisions after `after` (exclusive).
+    #[cfg(feature = "net")]
+    NetworkDecisions {
+        /// Exclusive sequence cursor. `0` starts at the oldest retained event.
+        #[serde(default)]
+        after: u64,
+    },
+
+    /// Replay, then optionally follow, network-policy decisions as JSON lines.
+    #[cfg(feature = "net")]
+    NetworkDecisionStream {
+        /// Exclusive sequence cursor. `0` starts at the oldest retained event.
+        #[serde(default)]
+        after: u64,
+        /// When true, keep the connection open until the sandbox stops.
+        #[serde(default)]
+        follow: bool,
+    },
 }
 
 /// One live secret change carried by [`ControlRequest::SecretsUpdate`].
@@ -121,6 +140,11 @@ pub struct ControlResponse {
     /// Supported operations, present for capability requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<ControlCapabilities>,
+
+    /// Buffered network-policy decisions, present for snapshot requests.
+    #[cfg(feature = "net")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_decisions: Option<NetworkDecisionSnapshot>,
 }
 
 /// Live-control operations supported by this sandbox process, carried in
@@ -137,6 +161,26 @@ pub struct ControlCapabilities {
 
     /// Live secret rotation, removal, and allowed-host updates are available.
     pub secrets_update: bool,
+
+    /// Network-policy decision snapshot and follow are available.
+    #[serde(default)]
+    pub network_decisions: bool,
+}
+
+/// Snapshot of retained network-policy decisions.
+#[cfg(feature = "net")]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct NetworkDecisionSnapshot {
+    /// Events with sequence greater than the request cursor.
+    pub events: Vec<microsandbox_network::NetworkDecisionEvent>,
+    /// Events discarded because the ring buffer wrapped.
+    pub dropped_count: u64,
+    /// Oldest retained sequence, or `0` when empty.
+    pub earliest_retained_sequence: u64,
+    /// Next sequence that will be assigned.
+    pub next_sequence: u64,
+    /// Whether the sandbox decision log has closed.
+    pub closed: bool,
 }
 
 /// Memory sizing carried in [`ControlResponse`], all in MiB.
@@ -181,6 +225,10 @@ pub struct ControlContext {
     /// enabled and the sandbox booted with secrets.
     #[cfg(feature = "net")]
     pub secrets: Option<microsandbox_network::secrets::handle::SecretsHandle>,
+
+    /// Network-policy decision log, when networking is enabled.
+    #[cfg(feature = "net")]
+    pub decisions: Option<microsandbox_network::DecisionHandle>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -192,6 +240,17 @@ impl ControlContext {
         #[cfg(feature = "net")]
         {
             self.secrets.is_some()
+        }
+        #[cfg(not(feature = "net"))]
+        {
+            false
+        }
+    }
+
+    fn decisions_supported(&self) -> bool {
+        #[cfg(feature = "net")]
+        {
+            self.decisions.is_some()
         }
         #[cfg(not(feature = "net"))]
         {
@@ -258,6 +317,12 @@ fn serve_connection(
 ) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(&mut *stream).read_line(&mut line)?;
+    #[cfg(feature = "net")]
+    if let Ok(ControlRequest::NetworkDecisionStream { after, follow }) =
+        serde_json::from_str::<ControlRequest>(line.trim())
+    {
+        return serve_network_decision_stream(stream, context, after, follow);
+    }
     stream.write_all(&respond_to_line(line.trim(), context))
 }
 
@@ -387,6 +452,7 @@ fn handle_request(request: ControlRequest, context: &ControlContext) -> ControlR
                 cpu_resize: control.cpu_resize_supported(),
                 memory_resize: control.memory_resize_supported(),
                 secrets_update: context.secrets_update_supported(),
+                network_decisions: context.decisions_supported(),
             }),
             ..Default::default()
         },
@@ -405,6 +471,14 @@ fn handle_request(request: ControlRequest, context: &ControlContext) -> ControlR
         }
         ControlRequest::CpuState => cpu(control.cpu_state()),
         ControlRequest::SecretsUpdate { changes } => handle_secrets_update(context, changes),
+        #[cfg(feature = "net")]
+        ControlRequest::NetworkDecisions { after } => handle_network_decisions(context, after),
+        #[cfg(feature = "net")]
+        ControlRequest::NetworkDecisionStream { .. } => ControlResponse {
+            ok: false,
+            error: Some("network decision streams must be served as a follow connection".into()),
+            ..Default::default()
+        },
     }
 }
 
@@ -465,6 +539,101 @@ fn handle_secrets_update(
         error: Some("this runtime was built without network support".to_string()),
         ..Default::default()
     }
+}
+
+#[cfg(feature = "net")]
+fn handle_network_decisions(context: &ControlContext, after: u64) -> ControlResponse {
+    let Some(log) = &context.decisions else {
+        return ControlResponse {
+            ok: false,
+            error: Some("network decisions are not available for this sandbox".into()),
+            ..Default::default()
+        };
+    };
+    let snap = log.snapshot_after(after);
+    ControlResponse {
+        ok: true,
+        network_decisions: Some(NetworkDecisionSnapshot {
+            events: snap.events,
+            dropped_count: snap.dropped_count,
+            earliest_retained_sequence: snap.earliest_retained_sequence,
+            next_sequence: snap.next_sequence,
+            closed: snap.closed,
+        }),
+        ..Default::default()
+    }
+}
+
+#[cfg(all(unix, feature = "net"))]
+fn serve_network_decision_stream(
+    stream: &mut std::os::unix::net::UnixStream,
+    context: &ControlContext,
+    mut after: u64,
+    follow: bool,
+) -> std::io::Result<()> {
+    let Some(log) = context.decisions.clone() else {
+        let response = ControlResponse {
+            ok: false,
+            error: Some("network decisions are not available for this sandbox".into()),
+            ..Default::default()
+        };
+        let mut payload = serde_json::to_vec(&response).unwrap_or_default();
+        payload.push(b'\n');
+        return stream.write_all(&payload);
+    };
+
+    if !follow {
+        let snap = log.snapshot_after(after);
+        for event in snap.events {
+            write_json_line(stream, &event)?;
+        }
+        write_done_line(
+            stream,
+            if snap.closed {
+                "sandbox_stopped"
+            } else {
+                "drained"
+            },
+        )?;
+        return Ok(());
+    }
+
+    loop {
+        match log.wait_after(after) {
+            microsandbox_network::FollowOutcome::Events { events, closed, .. } => {
+                for event in events {
+                    after = event.sequence;
+                    write_json_line(stream, &event)?;
+                }
+                if closed {
+                    write_done_line(stream, "sandbox_stopped")?;
+                    return Ok(());
+                }
+            }
+            microsandbox_network::FollowOutcome::Closed { .. } => {
+                write_done_line(stream, "sandbox_stopped")?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "net"))]
+fn write_json_line(
+    stream: &mut std::os::unix::net::UnixStream,
+    value: &impl serde::Serialize,
+) -> std::io::Result<()> {
+    let mut payload = serde_json::to_vec(value).unwrap_or_default();
+    payload.push(b'\n');
+    stream.write_all(&payload)
+}
+
+#[cfg(all(unix, feature = "net"))]
+fn write_done_line(
+    stream: &mut std::os::unix::net::UnixStream,
+    reason: &str,
+) -> std::io::Result<()> {
+    stream.write_all(format!("{{\"done\":true,\"reason\":\"{reason}\"}}\n").as_bytes())
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -529,6 +698,7 @@ mod tests {
                 cpu_resize: true,
                 memory_resize: false,
                 secrets_update: true,
+                network_decisions: true,
             }),
             ..Default::default()
         };

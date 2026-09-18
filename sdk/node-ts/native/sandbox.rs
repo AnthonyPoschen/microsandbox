@@ -69,6 +69,12 @@ pub struct JsLogStream {
     rx: Arc<Mutex<tokio::sync::mpsc::Receiver<napi::Result<LogEntry>>>>,
 }
 
+/// Streaming subscription for network-policy decisions.
+#[napi(async_iterator, js_name = "NetworkDecisionStream")]
+pub struct JsNetworkDecisionStream {
+    rx: Arc<Mutex<tokio::sync::mpsc::Receiver<napi::Result<JsNetworkDecision>>>>,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -435,6 +441,60 @@ impl Sandbox {
         run_modify(builder, modify_dry_run(options.as_ref())).await
     }
 
+    /// Read buffered network-policy decisions after `afterSequence`.
+    #[napi]
+    pub async fn network_decisions(
+        &self,
+        after_sequence: Option<f64>,
+    ) -> Result<Vec<JsNetworkDecision>> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let snap = sb
+            .network_decisions(microsandbox::NetworkDecisionOptions {
+                after_sequence: after_sequence.unwrap_or(0.0) as u64,
+                follow: false,
+            })
+            .await
+            .map_err(to_napi_error)?;
+        Ok(snap.events.iter().map(js_network_decision).collect())
+    }
+
+    /// Stream network-policy decisions. Pass `follow: true` to keep reading
+    /// until the sandbox stops.
+    #[napi]
+    pub async fn network_decision_stream(
+        &self,
+        after_sequence: Option<f64>,
+        follow: Option<bool>,
+    ) -> Result<JsNetworkDecisionStream> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let mut stream = Box::pin(sb.network_decision_stream(
+            microsandbox::NetworkDecisionOptions {
+                after_sequence: after_sequence.unwrap_or(0.0) as u64,
+                follow: follow.unwrap_or(false),
+            },
+        ));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(result) = stream.next().await {
+                let item = match result {
+                    Ok(microsandbox::NetworkDecisionItem::Event(event)) => {
+                        Ok(js_network_decision(&event))
+                    }
+                    Ok(microsandbox::NetworkDecisionItem::End(_)) => break,
+                    Err(error) => Err(to_napi_error(error)),
+                };
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(JsNetworkDecisionStream {
+            rx: Arc::new(Mutex::new(rx)),
+        })
+    }
+
     /// Stream metrics snapshots at the requested interval (in milliseconds).
     #[napi]
     pub async fn metrics_stream(&self, interval_ms: f64) -> Result<JsMetricsStream> {
@@ -725,6 +785,67 @@ fn sandbox_page_to_js(page: microsandbox::sandbox::SandboxPage) -> JsSandboxPage
             .map(JsSandboxHandle::from_rust)
             .collect(),
         next_cursor: page.next_cursor,
+    }
+}
+
+#[napi]
+impl JsNetworkDecisionStream {
+    /// Receive the next decision. Returns `null` when the stream ends.
+    #[napi]
+    pub async fn recv(&self) -> Result<Option<JsNetworkDecision>> {
+        let mut guard = self.rx.lock().await;
+        match guard.recv().await {
+            Some(result) => Ok(Some(result?)),
+            None => Ok(None),
+        }
+    }
+}
+
+#[napi]
+impl AsyncGenerator for JsNetworkDecisionStream {
+    type Yield = JsNetworkDecision;
+    type Next = ();
+    type Return = ();
+
+    fn next(
+        &mut self,
+        _value: Option<Self::Next>,
+    ) -> impl std::future::Future<Output = Result<Option<Self::Yield>>> + Send + 'static {
+        let rx = Arc::clone(&self.rx);
+        async move {
+            let mut guard = rx.lock().await;
+            match guard.recv().await {
+                Some(result) => Ok(Some(result?)),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+fn js_network_decision(event: &microsandbox_network::NetworkDecisionEvent) -> JsNetworkDecision {
+    JsNetworkDecision {
+        sequence: event.sequence as f64,
+        timestamp: event.timestamp.clone(),
+        phase: serde_json::to_value(event.phase)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        action: serde_json::to_value(event.action)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        reason: event.reason.clone(),
+        destination_host: event.destination_host.clone(),
+        destination_ip: event.destination_ip.map(|ip| ip.to_string()),
+        destination_port: event.destination_port,
+        transport: event.transport.clone(),
+        protocol: event.protocol.clone(),
+        sni: event.sni.clone(),
+        http_authority: event.http_authority.clone(),
+        correlation_id: event.correlation_id.clone(),
+        matched_rule: event.matched_rule.clone(),
+        dropped_count: event.dropped_count as f64,
+        earliest_retained_sequence: event.earliest_retained_sequence as f64,
     }
 }
 

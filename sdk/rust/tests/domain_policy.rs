@@ -34,6 +34,8 @@ fn allow_domain_https(domain: &str) -> Rule {
         destination: Destination::Domain(domain.parse().expect("valid domain")),
         protocols: vec![Protocol::Tcp],
         ports: vec![PortRange::single(443)],
+        methods: Vec::new(),
+        paths: Vec::new(),
         action: Action::Allow,
     }
 }
@@ -45,6 +47,8 @@ fn allow_domain_http(domain: &str) -> Rule {
         destination: Destination::Domain(domain.parse().expect("valid domain")),
         protocols: vec![Protocol::Tcp],
         ports: vec![PortRange::single(80)],
+        methods: Vec::new(),
+        paths: Vec::new(),
         action: Action::Allow,
     }
 }
@@ -56,6 +60,8 @@ fn allow_domain_suffix_https(suffix: &str) -> Rule {
         destination: Destination::DomainSuffix(suffix.parse().expect("valid domain suffix")),
         protocols: vec![Protocol::Tcp],
         ports: vec![PortRange::single(443)],
+        methods: Vec::new(),
+        paths: Vec::new(),
         action: Action::Allow,
     }
 }

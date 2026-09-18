@@ -492,6 +492,19 @@ export class Sandbox implements AsyncDisposable {
     return modificationPlanFromJson(raw);
   }
 
+  /** Read buffered network-policy decisions after `afterSequence`. */
+  async networkDecisions(afterSequence = 0) {
+    return await withMappedErrors(() => this.inner.networkDecisions(afterSequence));
+  }
+
+  /** Stream network-policy decisions. Pass `{ follow: true }` to keep reading until the sandbox stops. */
+  async networkDecisionStream(opts?: { afterSequence?: number; follow?: boolean }) {
+    const raw = await withMappedErrors(() =>
+      this.inner.networkDecisionStream(opts?.afterSequence, opts?.follow),
+    );
+    return raw;
+  }
+
   /** Stream metrics snapshots at the given interval (in milliseconds). */
   async metricsStream(intervalMs: number): Promise<MetricsStream> {
     const raw = await withMappedErrors(() =>

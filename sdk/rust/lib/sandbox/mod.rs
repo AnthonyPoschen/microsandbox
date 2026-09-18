@@ -16,6 +16,8 @@ mod identity;
 pub mod init;
 pub(crate) mod metrics;
 mod modify;
+#[cfg(feature = "net")]
+pub(crate) mod network_decisions;
 mod patch;
 #[cfg(windows)]
 mod reap;
@@ -125,7 +127,7 @@ pub use microsandbox_network::config::{NetworkConfig, PublishedPort};
 pub use microsandbox_network::dns::Nameserver;
 #[cfg(feature = "net")]
 pub use microsandbox_network::policy::{
-    Action as NetworkAction, NetworkPolicy, NetworkProfile, Rule as NetworkRule,
+    Action as NetworkAction, HttpMethod, NetworkPolicy, NetworkProfile, Rule as NetworkRule,
 };
 #[cfg(feature = "net")]
 pub use microsandbox_network::{OutboundProxy, Socks5Credentials};
@@ -149,6 +151,10 @@ pub use modify::{
     ResourceResizeStatus, SandboxModificationBuilder, SandboxModificationPatch,
     SandboxModificationPlan, SecretChangeKind, SecretModificationPatch, SecretPatchBuilder,
     SecretPlannedChange, SecretSource,
+};
+#[cfg(feature = "net")]
+pub use network_decisions::{
+    NetworkDecisionEnd, NetworkDecisionItem, NetworkDecisionOptions, NetworkDecisionStream,
 };
 #[cfg(feature = "ssh")]
 pub use ssh::{

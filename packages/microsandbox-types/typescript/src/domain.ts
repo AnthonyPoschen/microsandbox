@@ -155,6 +155,16 @@ export type Rule = {
    */
   ports: Array<PortRange>;
   /**
+   * HTTP method set; empty matches any method. Evaluated for plaintext
+   * HTTP/1 and for HTTP/1 and HTTP/2 decrypted by TLS interception.
+   */
+  methods?: Array<HttpMethod>;
+  /**
+   * HTTP path set; empty matches any path. Exact origin-form path
+   * match with query and fragment stripped.
+   */
+  paths?: Array<string>;
+  /**
    * Action to take on a match.
    */
   action: Action;
@@ -165,6 +175,18 @@ export type Action = "allow" | "deny";
 export type Direction = "egress" | "ingress" | "any";
 
 export type Protocol = "tcp" | "udp" | "icmpv4" | "icmpv6";
+
+export type HttpMethod =
+  | "GET"
+  | "HEAD"
+  | "POST"
+  | "PUT"
+  | "DELETE"
+  | "CONNECT"
+  | "OPTIONS"
+  | "TRACE"
+  | "PATCH"
+  | "QUERY";
 
 export type Destination = "any" | { "cidr": string } | { "domain": string } | {
   "domain_suffix": string;
