@@ -72,6 +72,7 @@ pub use sandbox::{
 #[cfg(feature = "net")]
 pub use sandbox::{
     DnsConfigPatch, HostPattern, HttpMethod, InterfaceOverridesPatch, Nameserver, NetworkAction,
+    NetworkDecisionEnd, NetworkDecisionItem, NetworkDecisionOptions, NetworkDecisionStream,
     NetworkPolicy, NetworkProfile, NetworkRateLimiterConfigPatch, NetworkRule, OutboundProxy,
     PublishedPort, SecretInjection, SecretsConfigPatch, Socks5Credentials, TlsConfigPatch,
 };

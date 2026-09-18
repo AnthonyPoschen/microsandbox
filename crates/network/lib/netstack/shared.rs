@@ -17,6 +17,9 @@ pub use microsandbox_utils::wake_pipe::WakePipe;
 use parking_lot::RwLock;
 
 use crate::addr::normalize_ip_addr;
+use crate::decision::{
+    DEFAULT_DECISION_BUFFER_CAPACITY, DecisionLog, clamp_decision_buffer_capacity,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -79,6 +82,12 @@ pub struct SharedState {
 
     /// Aggregate network byte counters at the guest/runtime boundary.
     metrics: NetworkMetrics,
+
+    /// Bounded log of network-policy enforcement decisions.
+    decisions: DecisionLog,
+
+    /// Monotonic generator for connection/request correlation ids.
+    correlation_seq: AtomicU64,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -111,6 +120,11 @@ struct ResolvedHostnameKey {
 impl SharedState {
     /// Create shared state with the given queue capacity.
     pub fn new(queue_capacity: usize) -> Self {
+        Self::with_decision_capacity(queue_capacity, DEFAULT_DECISION_BUFFER_CAPACITY)
+    }
+
+    /// Create shared state with an explicit decision-log capacity.
+    pub fn with_decision_capacity(queue_capacity: usize, decision_capacity: usize) -> Self {
         Self {
             tx_ring: ArrayQueue::new(queue_capacity),
             rx_ring: ArrayQueue::new(queue_capacity),
@@ -122,7 +136,22 @@ impl SharedState {
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
             metrics: NetworkMetrics::default(),
+            decisions: DecisionLog::with_capacity(clamp_decision_buffer_capacity(
+                decision_capacity,
+            )),
+            correlation_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Per-sandbox network-decision log.
+    pub fn decisions(&self) -> &DecisionLog {
+        &self.decisions
+    }
+
+    /// Allocate a correlation identifier (`{kind}-{n}`).
+    pub fn next_correlation_id(&self, kind: &str) -> String {
+        let n = self.correlation_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("{kind}-{n}")
     }
 
     /// Set the per-sandbox gateway IPs. Called once at boot. Each family is

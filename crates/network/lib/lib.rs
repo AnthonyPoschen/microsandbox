@@ -15,6 +15,7 @@ mod addr;
 pub mod proxy;
 
 pub mod config;
+pub mod decision;
 pub mod dns;
 pub mod icmp;
 pub mod netstack;
@@ -49,6 +50,10 @@ pub use proxy::{
 };
 
 pub use config::builder;
+pub use decision::{
+    DEFAULT_DECISION_BUFFER_CAPACITY, DecisionAction, DecisionHandle, DecisionLog, DecisionPhase,
+    DecisionSnapshot, FollowOutcome, NetworkDecisionEvent, clamp_decision_buffer_capacity,
+};
 pub use icmp::{error as icmp_error, relay as icmp_relay};
 pub use netstack::{backend, device, poll as stack, shared};
 pub use ports::publisher;

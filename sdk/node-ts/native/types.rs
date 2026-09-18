@@ -31,6 +31,27 @@ pub struct SandboxTouchResult {
     pub activity_seq: f64,
 }
 
+/// One network-policy enforcement event.
+#[napi(object, js_name = "NetworkDecision")]
+pub struct JsNetworkDecision {
+    pub sequence: f64,
+    pub timestamp: String,
+    pub phase: String,
+    pub action: String,
+    pub reason: String,
+    pub destination_host: Option<String>,
+    pub destination_ip: Option<String>,
+    pub destination_port: Option<u16>,
+    pub transport: String,
+    pub protocol: Option<String>,
+    pub sni: Option<String>,
+    pub http_authority: Option<String>,
+    pub correlation_id: Option<String>,
+    pub matched_rule: Option<String>,
+    pub dropped_count: f64,
+    pub earliest_retained_sequence: f64,
+}
+
 /// Options accepted by `Sandbox.modify()` / `SandboxHandle.modify()`.
 ///
 /// `memoryMib` / `maxMemoryMib` / `rootDiskSizeMib` are in MiB. `policy` is `"no_restart"`

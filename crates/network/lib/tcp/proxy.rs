@@ -20,6 +20,7 @@ use super::connection::ProxyConnectState;
 #[cfg(test)]
 use super::connection::ProxyConnectStatus;
 use super::upstream::UpstreamTcpTarget;
+use crate::decision::{emit_error, emit_http, emit_tcp};
 use crate::netstack::shared::SharedState;
 use crate::policy::{
     EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol,
@@ -82,6 +83,7 @@ pub(crate) struct TcpProxy {
     strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    correlation_id: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -161,7 +163,14 @@ impl TcpProxy {
             strict,
             proxy_connect,
             outbound_proxy,
+            correlation_id: None,
         }
+    }
+
+    /// Attach a correlation identifier shared with TLS/HTTP events.
+    pub(crate) fn with_correlation_id(mut self, correlation_id: String) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
     }
 
     /// Run the TCP proxy task to completion.
@@ -193,6 +202,7 @@ impl TcpProxy {
             strict,
             proxy_connect,
             outbound_proxy,
+            correlation_id,
         } = self;
 
         // Pre-connect peek is only for domain policy: the hostname has to be known
@@ -221,13 +231,14 @@ impl TcpProxy {
             } else {
                 HttpRequestMatch::Unknown
             };
-            match network_policy.evaluate_egress_http(
+            let decision = network_policy.evaluate_egress_http_decision(
                 guest_dst,
                 Protocol::Tcp,
                 &shared,
                 source,
                 http,
-            ) {
+            );
+            match decision.evaluation {
                 EgressEvaluation::Allow => {
                     if strict_hostname_allow_is_opaque(
                         strict,
@@ -242,16 +253,41 @@ impl TcpProxy {
                             dst = %guest_dst,
                             "TCP egress denied by strict hostname policy",
                         );
+                        emit_error(
+                            &shared,
+                            crate::decision::DecisionPhase::Tcp,
+                            "strict_hostname_deny",
+                            guest_dst,
+                            "tcp",
+                            None,
+                            sni.clone(),
+                            sni.clone(),
+                            correlation_id.clone(),
+                        );
                         proxy_connect.mark_policy_denied();
                         shared.proxy_wake.wake();
                         return Ok(());
                     }
+                    emit_tcp(
+                        &shared,
+                        &decision,
+                        guest_dst,
+                        sni.clone(),
+                        correlation_id.clone(),
+                    );
                 }
                 EgressEvaluation::Deny => {
                     tracing::debug!(
                         dst = %guest_dst,
                         source = source.label(),
                         "TCP egress denied by domain policy",
+                    );
+                    emit_tcp(
+                        &shared,
+                        &decision,
+                        guest_dst,
+                        sni.clone(),
+                        correlation_id.clone(),
                     );
                     proxy_connect.mark_policy_denied();
                     shared.proxy_wake.wake();
@@ -290,6 +326,7 @@ impl TcpProxy {
                     proxy_connect,
                     outbound_proxy,
                     None,
+                    correlation_id.clone(),
                 )
                 .await;
             }
@@ -355,6 +392,7 @@ impl TcpProxy {
                 proxy_connect,
                 outbound_proxy,
                 Some(proxy_stream),
+                correlation_id.clone(),
             )
             .await;
         }
@@ -368,8 +406,13 @@ impl TcpProxy {
         let mut stop_after_replay = false;
         if enforce_http_filters {
             if plaintext_http1 {
-                let (allowed, stop) =
-                    take_allowed_http1_prefix(&network_policy, guest_dst, &shared, &initial_buf);
+                let (allowed, stop) = take_allowed_http1_prefix(
+                    &network_policy,
+                    guest_dst,
+                    &shared,
+                    &initial_buf,
+                    correlation_id.as_deref(),
+                );
                 if allowed.is_empty() {
                     tracing::debug!(
                         dst = %guest_dst,
@@ -385,6 +428,7 @@ impl TcpProxy {
                 &shared,
                 &initial_buf,
                 is_tls || http2_preface,
+                correlation_id.as_deref(),
             ) {
                 tracing::debug!(
                     dst = %guest_dst,
@@ -486,6 +530,7 @@ impl TcpProxy {
                                     proxy_connect,
                                     outbound_proxy,
                                     Some(proxy_stream),
+                                    correlation_id.clone(),
                                 )
                                 .await;
                             }
@@ -645,6 +690,7 @@ async fn handle_connect_tunnel(
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     preconnected_proxy: Option<TcpStream>,
+    correlation_id: Option<String>,
 ) -> io::Result<()> {
     let proxy_dst = proxy_target.primary();
     let connect_req =
@@ -773,6 +819,7 @@ async fn handle_connect_tunnel(
         // above) is never consulted again.
         None,
     )
+    .with_correlation_id(correlation_id.unwrap_or_default())
     .with_upstream(proxy_stream)
     .with_expected_sni(expected_sni)
     .with_initial_buf(tls_seed)
@@ -1103,13 +1150,14 @@ fn take_allowed_http1_prefix(
     guest_dst: SocketAddr,
     shared: &SharedState,
     buf: &[u8],
+    correlation_id: Option<&str>,
 ) -> (Vec<u8>, bool) {
     let mut rest = buf;
     let mut allowed = Vec::new();
     while !rest.is_empty() {
         if let Some(end) = next_http1_message_end(rest) {
             let (message, tail) = rest.split_at(end);
-            if !http_request_allowed(policy, guest_dst, shared, message, false) {
+            if !http_request_allowed(policy, guest_dst, shared, message, false, correlation_id) {
                 return (allowed, true);
             }
             allowed.extend_from_slice(message);
@@ -1121,7 +1169,14 @@ fn take_allowed_http1_prefix(
             let stop = allowed.is_empty();
             return (allowed, stop);
         };
-        if !http_request_allowed(policy, guest_dst, shared, &rest[..header_end], false) {
+        if !http_request_allowed(
+            policy,
+            guest_dst,
+            shared,
+            &rest[..header_end],
+            false,
+            correlation_id,
+        ) {
             return (allowed, true);
         }
         allowed.extend_from_slice(rest);
@@ -1136,6 +1191,7 @@ fn http_request_allowed(
     shared: &SharedState,
     buf: &[u8],
     is_tls: bool,
+    correlation_id: Option<&str>,
 ) -> bool {
     let http = if is_tls || buf.is_empty() || is_http2_client_preface(buf) {
         HttpRequestMatch::NotHttp
@@ -1149,10 +1205,22 @@ fn http_request_allowed(
         Some(name) => HostnameSource::Sni(name),
         None => HostnameSource::CacheOnly,
     };
-    matches!(
-        policy.evaluate_egress_http(guest_dst, Protocol::Tcp, shared, source, http),
-        EgressEvaluation::Allow
-    )
+    let decision =
+        policy.evaluate_egress_http_decision(guest_dst, Protocol::Tcp, shared, source, http);
+    if !matches!(
+        decision.evaluation,
+        EgressEvaluation::DeferUntilHostname | EgressEvaluation::DeferUntilHttp
+    ) {
+        emit_http(
+            shared,
+            &decision,
+            guest_dst,
+            host,
+            None,
+            correlation_id.map(str::to_string),
+        );
+    }
+    matches!(decision.evaluation, EgressEvaluation::Allow)
 }
 
 /// Extract the `Host:` header value from an already-buffered HTTP header block.
@@ -1483,6 +1551,7 @@ mod tests {
             false,
             proxy_connect.clone(),
             Some(Arc::new(outbound_proxy)),
+            None,
             None,
         )
         .await

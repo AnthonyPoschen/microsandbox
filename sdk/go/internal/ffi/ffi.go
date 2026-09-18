@@ -197,6 +197,10 @@ typedef char *(*msb_sandbox_log_stream_fn)(uint64_t cancel_id, uint64_t handle, 
 typedef char *(*msb_sandbox_handle_log_stream_fn)(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_log_recv_fn)(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_log_close_fn)(uint64_t stream_handle, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_sandbox_network_decisions_fn)(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_sandbox_network_decision_stream_fn)(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_network_decision_recv_fn)(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_network_decision_close_fn)(uint64_t stream_handle, uint8_t *buf, size_t buf_len);
 
 typedef char *(*msb_volume_create_fn)(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_volume_remove_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
@@ -341,6 +345,10 @@ static msb_sandbox_log_stream_fn        ptr_msb_sandbox_log_stream        = NULL
 static msb_sandbox_handle_log_stream_fn ptr_msb_sandbox_handle_log_stream = NULL;
 static msb_log_recv_fn                  ptr_msb_log_recv                  = NULL;
 static msb_log_close_fn                 ptr_msb_log_close                 = NULL;
+static msb_sandbox_network_decisions_fn ptr_msb_sandbox_network_decisions = NULL;
+static msb_sandbox_network_decision_stream_fn ptr_msb_sandbox_network_decision_stream = NULL;
+static msb_network_decision_recv_fn     ptr_msb_network_decision_recv     = NULL;
+static msb_network_decision_close_fn    ptr_msb_network_decision_close    = NULL;
 static msb_volume_create_fn       ptr_msb_volume_create       = NULL;
 static msb_volume_remove_fn       ptr_msb_volume_remove       = NULL;
 static msb_volume_list_fn         ptr_msb_volume_list         = NULL;
@@ -517,6 +525,10 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE(msb_sandbox_handle_log_stream);
 	RESOLVE(msb_log_recv);
 	RESOLVE(msb_log_close);
+	RESOLVE(msb_sandbox_network_decisions);
+	RESOLVE(msb_sandbox_network_decision_stream);
+	RESOLVE(msb_network_decision_recv);
+	RESOLVE(msb_network_decision_close);
 	RESOLVE(msb_volume_create);
 	RESOLVE(msb_volume_remove);
 	RESOLVE(msb_volume_list);
@@ -851,6 +863,18 @@ char *call_msb_log_recv(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf
 }
 char *call_msb_log_close(uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_log_close ? ptr_msb_log_close(stream_handle, buf, buf_len) : NULL;
+}
+char *call_msb_sandbox_network_decisions(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_sandbox_network_decisions ? ptr_msb_sandbox_network_decisions(cancel_id, handle, opts_json, buf, buf_len) : NULL;
+}
+char *call_msb_sandbox_network_decision_stream(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_sandbox_network_decision_stream ? ptr_msb_sandbox_network_decision_stream(cancel_id, handle, opts_json, buf, buf_len) : NULL;
+}
+char *call_msb_network_decision_recv(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_network_decision_recv ? ptr_msb_network_decision_recv(cancel_id, stream_handle, buf, buf_len) : NULL;
+}
+char *call_msb_network_decision_close(uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_network_decision_close ? ptr_msb_network_decision_close(stream_handle, buf, buf_len) : NULL;
 }
 char *call_msb_volume_create(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_volume_create ? ptr_msb_volume_create(cancel_id, name, opts_json, buf, buf_len) : NULL;
@@ -3591,6 +3615,144 @@ func (h *LogStreamHandle) Close() error {
 	}
 	buf := make([]byte, defaultBufSize)
 	errPtr := C.call_msb_log_close(h.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	if errPtr != nil {
+		msg := C.GoString(errPtr)
+		C.call_msb_free_string(errPtr)
+		var e Error
+		if jerr := json.Unmarshal([]byte(msg), &e); jerr != nil {
+			e = Error{Kind: KindInternal, Message: msg}
+		}
+		return &e
+	}
+	return nil
+}
+
+// =============================================================================
+// Network decisions
+// =============================================================================
+
+// NetworkDecisionOptions configures a snapshot or stream of policy decisions.
+type NetworkDecisionOptions struct {
+	AfterSequence uint64 `json:"after_sequence,omitempty"`
+	Follow        bool   `json:"follow,omitempty"`
+}
+
+// NetworkDecision is one enforcement event from the sandbox network stack.
+type NetworkDecision struct {
+	Sequence                 uint64  `json:"sequence"`
+	Timestamp                string  `json:"timestamp"`
+	Phase                    string  `json:"phase"`
+	Action                   string  `json:"action"`
+	Reason                   string  `json:"reason"`
+	DestinationHost          *string `json:"destination_host,omitempty"`
+	DestinationIP            *string `json:"destination_ip,omitempty"`
+	DestinationPort          *uint16 `json:"destination_port,omitempty"`
+	Transport                string  `json:"transport"`
+	Protocol                 *string `json:"protocol,omitempty"`
+	SNI                      *string `json:"sni,omitempty"`
+	HTTPAuthority            *string `json:"http_authority,omitempty"`
+	CorrelationID            *string `json:"correlation_id,omitempty"`
+	MatchedRule              *string `json:"matched_rule,omitempty"`
+	DroppedCount             uint64  `json:"dropped_count"`
+	EarliestRetainedSequence uint64  `json:"earliest_retained_sequence"`
+}
+
+// NetworkDecisionSnapshot is a replay of buffered events.
+type NetworkDecisionSnapshot struct {
+	Events                   []NetworkDecision `json:"events"`
+	DroppedCount             uint64            `json:"dropped_count"`
+	EarliestRetainedSequence uint64            `json:"earliest_retained_sequence"`
+	NextSequence             uint64            `json:"next_sequence"`
+	Closed                   bool              `json:"closed"`
+}
+
+// NetworkDecisionStreamHandle is an opaque live subscription.
+type NetworkDecisionStreamHandle struct {
+	handle C.uint64_t
+}
+
+// NetworkDecisions reads buffered enforcement events after the given cursor.
+func (s *Sandbox) NetworkDecisions(ctx context.Context, opts NetworkDecisionOptions) (*NetworkDecisionSnapshot, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		return nil, err
+	}
+	cOpts := C.CString(string(raw))
+	defer C.free(unsafe.Pointer(cOpts))
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_sandbox_network_decisions(cancelID, s.h(), cOpts, buf, bufLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var snap NetworkDecisionSnapshot
+	if err := json.Unmarshal([]byte(out), &snap); err != nil {
+		return nil, fmt.Errorf("parse network_decisions: %w", err)
+	}
+	return &snap, nil
+}
+
+// NetworkDecisionStream starts a replay/follow subscription.
+func (s *Sandbox) NetworkDecisionStream(ctx context.Context, opts NetworkDecisionOptions) (*NetworkDecisionStreamHandle, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		return nil, err
+	}
+	cOpts := C.CString(string(raw))
+	defer C.free(unsafe.Pointer(cOpts))
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_sandbox_network_decision_stream(cancelID, s.h(), cOpts, buf, bufLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		StreamHandle uint64 `json:"stream_handle"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return nil, fmt.Errorf("parse network_decision_stream: %w", err)
+	}
+	return &NetworkDecisionStreamHandle{handle: C.uint64_t(resp.StreamHandle)}, nil
+}
+
+// Recv blocks until the next decision arrives or ctx is cancelled.
+// Returns nil, nil when the stream has ended.
+func (h *NetworkDecisionStreamHandle) Recv(ctx context.Context) (*NetworkDecision, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_network_decision_recv(cancelID, h.handle, buf, bufLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var done struct {
+		Done bool `json:"done"`
+	}
+	if jerr := json.Unmarshal([]byte(out), &done); jerr == nil && done.Done {
+		return nil, nil
+	}
+	var event NetworkDecision
+	if err := json.Unmarshal([]byte(out), &event); err != nil {
+		return nil, fmt.Errorf("parse network_decision_recv: %w", err)
+	}
+	return &event, nil
+}
+
+// Close drops the stream handle.
+func (h *NetworkDecisionStreamHandle) Close() error {
+	if err := ensureLoaded(); err != nil {
+		return err
+	}
+	buf := make([]byte, defaultBufSize)
+	errPtr := C.call_msb_network_decision_close(h.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
 	if errPtr != nil {
 		msg := C.GoString(errPtr)
 		C.call_msb_free_string(errPtr)

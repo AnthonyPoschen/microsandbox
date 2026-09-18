@@ -179,6 +179,10 @@ pub struct Config {
     /// Metrics sampling interval in milliseconds; `None` disables sampling.
     pub metrics_sample_interval_ms: Option<NonZero<u64>>,
 
+    /// Per-sandbox network-decision ring-buffer capacity.
+    #[cfg(feature = "net")]
+    pub network_decision_buffer_capacity: usize,
+
     /// Shared-memory metrics registry coordinates passed in by the host.
     ///
     /// When `None`, the runtime skips metrics activation entirely — either
@@ -426,11 +430,18 @@ type NetworkSecretsHandle = microsandbox_network::secrets::handle::SecretsHandle
 #[cfg(not(feature = "net"))]
 type NetworkSecretsHandle = ();
 
+#[cfg(feature = "net")]
+type NetworkDecisionHandle = microsandbox_network::DecisionHandle;
+
+#[cfg(not(feature = "net"))]
+type NetworkDecisionHandle = ();
+
 type VmBuildOutput = (
     msb_krun::Vm,
     Option<NetworkTerminationHandle>,
     Option<NetworkMetricsHandle>,
     Option<NetworkSecretsHandle>,
+    Option<NetworkDecisionHandle>,
     Vec<u8>,
     BindIdentityMapRegistration,
 );
@@ -885,6 +896,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         _network_termination_handle,
         network_metrics_handle,
         _network_secrets_handle,
+        _network_decisions_handle,
         bootstrap_frame,
         bind_identity_map,
     ) = match build_result {
@@ -931,17 +943,30 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_handle = vm.exit_handle();
     let upper_host_path = oci_upper_host_path(&config.vm);
 
-    // Serve host-side live control when this VM booted with reserved resize
-    // capacity or with secrets to live-reconfigure. Failure is non-fatal: the
-    // SDK treats a missing socket as "no live control capability" and
-    // classifies restart-required.
+    // Serve host-side live control for resize, secret rotation, and
+    // network-decision follow. Failure is non-fatal: the SDK treats a
+    // missing socket as "no live control capability".
     {
         let control = vm.control_handle();
         #[cfg(feature = "net")]
         let secrets = _network_secrets_handle.clone();
         #[cfg(not(feature = "net"))]
         let secrets: Option<()> = None;
-        if control.memory_resize_supported() || control.cpu_resize_supported() || secrets.is_some()
+        #[cfg(feature = "net")]
+        let decisions = _network_decisions_handle.clone();
+        if control.memory_resize_supported()
+            || control.cpu_resize_supported()
+            || secrets.is_some()
+            || {
+                #[cfg(feature = "net")]
+                {
+                    decisions.is_some()
+                }
+                #[cfg(not(feature = "net"))]
+                {
+                    false
+                }
+            }
         {
             let control_sock_path =
                 crate::control::control_socket_path_for(&config.agent_sock_path);
@@ -949,6 +974,8 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 vm: control,
                 #[cfg(feature = "net")]
                 secrets,
+                #[cfg(feature = "net")]
+                decisions,
             };
             match crate::control::spawn_control_listener(control_sock_path.clone(), context) {
                 Ok(()) => {
@@ -1737,6 +1764,7 @@ fn build_vm(
     let mut network_termination_handle = None;
     let mut network_metrics_handle = None;
     let mut network_secrets_handle = None;
+    let mut network_decisions_handle = None;
 
     // Vsock routes are independent of virtio-net. Microsandbox owns the host
     // local IPC endpoints while libkrun retains framing, queues and credits.
@@ -1840,11 +1868,16 @@ fn build_vm(
             .map_err(|err| RuntimeError::Custom(format!("invalid network secrets: {err}")))?;
         let rate_limiters = to_krun_network_rate_limiters(vm.network.config());
 
-        let mut network =
-            SmoltcpNetwork::new(vm.network.clone(), vm.sandbox_slot, vm.deployment_profile)
-                .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
+        let mut network = SmoltcpNetwork::new_with_decision_capacity(
+            vm.network.clone(),
+            vm.sandbox_slot,
+            vm.deployment_profile,
+            config.network_decision_buffer_capacity,
+        )
+        .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());
+        network_decisions_handle = Some(network.decision_handle());
         // Only sandboxes that booted with secrets can be live-reconfigured:
         // new placeholders cannot be introduced into a running guest, so a
         // secret-free boot never needs the secrets side of the control socket.
@@ -1936,6 +1969,7 @@ fn build_vm(
         network_termination_handle,
         network_metrics_handle,
         network_secrets_handle,
+        network_decisions_handle,
         bootstrap_frame,
         bind_identity_map,
     ))

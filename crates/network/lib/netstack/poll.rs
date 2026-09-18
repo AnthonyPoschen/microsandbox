@@ -22,13 +22,14 @@ use smoltcp::wire::{
 };
 
 use crate::config::{DnsConfig, PublishedPort};
+use crate::decision::{emit_tcp, emit_udp};
 use crate::dns::common::ports::DnsPortType;
 use crate::dns::{
     interceptor::DnsInterceptor,
     proxies::{dot::DotProxy, tcp::DnsTcpProxy},
 };
 use crate::icmp::relay::IcmpRelay;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::{EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::handle::SecretsHandle;
@@ -359,60 +360,21 @@ pub fn smoltcp_poll_loop(
 
             match classify_frame(frame) {
                 FrameAction::TcpSyn { src, dst } => {
-                    let allow = match DnsPortType::from_tcp(dst.port()) {
-                        // Plain DNS: the interceptor enforces policy at
-                        // the application layer (block list + rebind
-                        // protection); bypass the network egress check.
-                        DnsPortType::Dns => true,
-                        // DoT: intercept only when TLS MITM is
-                        // configured. Without it, the block list can't
-                        // apply (traffic is encrypted end-to-end), so
-                        // we refuse to force a fall-back to plain
-                        // TCP/53. When TLS MITM is configured, bypass
-                        // egress policy the same way plain DNS does —
-                        // policy for the upstream resolver is applied
-                        // per query by the forwarder.
-                        DnsPortType::EncryptedDns => {
-                            if tls_state.is_some() {
-                                true
-                            } else {
-                                tracing::debug!(%dst, "DoT port refused (TLS interception not configured); stub should fall back to TCP/53");
-                                false
-                            }
-                        }
-                        // Alternative DNS protocol we can't proxy:
-                        // refuse outright — no socket means smoltcp
-                        // emits RST, which the guest's stub treats as
-                        // "upstream unavailable" and falls back to
-                        // plain TCP/53.
-                        DnsPortType::AlternativeDns => {
-                            tracing::debug!(%dst, "alternative-DNS TCP port refused; stub should fall back to TCP/53");
-                            false
-                        }
-                        // Other: regular outbound — defer Domain rules to first-flight;
-                        // accept unless an IP-layer rule denies.
-                        DnsPortType::Other => {
-                            let platform_allows = platform_policy.as_deref().is_none_or(|policy| {
-                                policy
-                                    .evaluate_egress(dst, Protocol::Tcp, &shared)
-                                    .is_allow()
-                            });
-                            platform_allows
-                                && matches!(
-                                    network_policy.evaluate_egress_with_source(
-                                        dst,
-                                        Protocol::Tcp,
-                                        &shared,
-                                        HostnameSource::Deferred,
-                                    ),
-                                    EgressEvaluation::Allow
-                                        | EgressEvaluation::DeferUntilHostname
-                                        | EgressEvaluation::DeferUntilHttp
-                                )
-                        }
-                    };
+                    let (allow, correlation_id) = evaluate_tcp_syn(
+                        dst,
+                        DnsPortType::from_tcp(dst.port()),
+                        &network_policy,
+                        platform_policy.as_deref(),
+                        &shared,
+                        tls_state.is_some(),
+                    );
                     if allow && !conn_tracker.has_socket_for(&src, &dst) {
-                        conn_tracker.create_tcp_socket(src, dst, &mut sockets);
+                        conn_tracker.create_tcp_socket_correlated(
+                            src,
+                            dst,
+                            &mut sockets,
+                            correlation_id.unwrap_or_default(),
+                        );
                     }
                     // Let smoltcp process — matching socket completes
                     // handshake, no socket means auto-RST.
@@ -522,6 +484,11 @@ pub fn smoltcp_poll_loop(
         // Detect newly-established connections and spawn proxy tasks.
         let new_conns = conn_tracker.take_new_connections(&mut sockets);
         for conn in new_conns {
+            let correlation_id = if conn.correlation_id.is_empty() {
+                shared.next_correlation_id("tcp")
+            } else {
+                conn.correlation_id.clone()
+            };
             if let Some(ref tls_state) = tls_state
                 && tls_state
                     .config
@@ -546,7 +513,8 @@ pub fn smoltcp_poll_loop(
                     strict,
                     conn.proxy_connect,
                     connection_outbound_proxy,
-                );
+                )
+                .with_correlation_id(correlation_id);
                 tokio_handle.spawn(proxy.run());
                 continue;
             }
@@ -621,7 +589,8 @@ pub fn smoltcp_poll_loop(
                 strict,
                 conn.proxy_connect,
                 connection_outbound_proxy,
-            );
+            )
+            .with_correlation_id(correlation_id);
             tokio_handle.spawn(proxy.run());
         }
 
@@ -667,6 +636,63 @@ pub fn smoltcp_poll_loop(
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+fn evaluate_tcp_syn(
+    dst: SocketAddr,
+    dns_port: DnsPortType,
+    network_policy: &NetworkPolicy,
+    platform_policy: Option<&NetworkPolicy>,
+    shared: &SharedState,
+    tls_configured: bool,
+) -> (bool, Option<String>) {
+    match dns_port {
+        DnsPortType::Dns => (true, None),
+        DnsPortType::EncryptedDns => {
+            if tls_configured {
+                (true, None)
+            } else {
+                tracing::debug!(%dst, "DoT port refused (TLS interception not configured); stub should fall back to TCP/53");
+                (false, None)
+            }
+        }
+        DnsPortType::AlternativeDns => {
+            tracing::debug!(%dst, "alternative-DNS TCP port refused; stub should fall back to TCP/53");
+            (false, None)
+        }
+        DnsPortType::Other => {
+            let correlation_id = shared.next_correlation_id("tcp");
+            if let Some(platform) = platform_policy {
+                let mut decision = platform.evaluate_egress_http_decision(
+                    dst,
+                    Protocol::Tcp,
+                    shared,
+                    HostnameSource::Deferred,
+                    HttpRequestMatch::Unknown,
+                );
+                if matches!(decision.evaluation, EgressEvaluation::Deny) {
+                    decision.matched_rule = "platform_policy".into();
+                    emit_tcp(shared, &decision, dst, None, Some(correlation_id.clone()));
+                    return (false, Some(correlation_id));
+                }
+            }
+            let decision = network_policy.evaluate_egress_http_decision(
+                dst,
+                Protocol::Tcp,
+                shared,
+                HostnameSource::Deferred,
+                HttpRequestMatch::Unknown,
+            );
+            emit_tcp(shared, &decision, dst, None, Some(correlation_id.clone()));
+            let allow = matches!(
+                decision.evaluation,
+                EgressEvaluation::Allow
+                    | EgressEvaluation::DeferUntilHostname
+                    | EgressEvaluation::DeferUntilHttp
+            );
+            (allow, Some(correlation_id))
+        }
+    }
+}
 
 #[cfg(unix)]
 fn sleep_until_stack_wake(shared: &SharedState, timeout_ms: i32, poll_fds: &mut [libc::pollfd; 2]) {
@@ -765,12 +791,30 @@ fn relay_udp_frame(
     }
 
     // Policy is applied after reassembly, when the UDP destination port is known.
-    if platform_policy
-        .is_some_and(|policy| policy.evaluate_egress(dst, Protocol::Udp, shared).is_deny())
-        || network_policy
-            .evaluate_egress(dst, Protocol::Udp, shared)
-            .is_deny()
-    {
+    let correlation_id = shared.next_correlation_id("udp");
+    if let Some(platform) = platform_policy {
+        let mut decision = platform.evaluate_egress_http_decision(
+            dst,
+            Protocol::Udp,
+            shared,
+            HostnameSource::CacheOnly,
+            HttpRequestMatch::NotHttp,
+        );
+        if matches!(decision.evaluation, EgressEvaluation::Deny) {
+            decision.matched_rule = "platform_policy".into();
+            emit_udp(shared, &decision, dst, None, Some(correlation_id.clone()));
+            return;
+        }
+    }
+    let decision = network_policy.evaluate_egress_http_decision(
+        dst,
+        Protocol::Udp,
+        shared,
+        HostnameSource::CacheOnly,
+        HttpRequestMatch::NotHttp,
+    );
+    emit_udp(shared, &decision, dst, None, Some(correlation_id));
+    if matches!(decision.evaluation, EgressEvaluation::Deny) {
         return;
     }
 

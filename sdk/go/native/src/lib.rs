@@ -4983,6 +4983,191 @@ pub unsafe extern "C" fn msb_log_close(
 }
 
 // ---------------------------------------------------------------------------
+// Network decision snapshot + streaming
+//
+// msb_sandbox_network_decisions        — snapshot after a sequence cursor
+// msb_sandbox_network_decision_stream  — start; returns stream_handle
+// msb_network_decision_recv            — next event or {"done":true}
+// msb_network_decision_close           — drop the stream
+// ---------------------------------------------------------------------------
+
+static NEXT_NETWORK_DECISION_STREAM_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+type NetworkDecisionStreamItem =
+    Result<microsandbox::NetworkDecisionItem, microsandbox::MicrosandboxError>;
+type NetworkDecisionStreamEntry =
+    std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<NetworkDecisionStreamItem>>>;
+
+fn network_decision_stream_registry() -> &'static RwLock<HashMap<Handle, NetworkDecisionStreamEntry>>
+{
+    static REG: OnceLock<RwLock<HashMap<Handle, NetworkDecisionStreamEntry>>> = OnceLock::new();
+    REG.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn register_network_decision_stream(
+    rx: tokio::sync::mpsc::Receiver<NetworkDecisionStreamItem>,
+) -> Result<Handle, FfiError> {
+    let h = NEXT_NETWORK_DECISION_STREAM_HANDLE.fetch_add(1, Ordering::Relaxed);
+    network_decision_stream_registry()
+        .write()
+        .map_err(|_| FfiError::internal("network decision stream registry lock poisoned"))?
+        .insert(h, std::sync::Arc::new(tokio::sync::Mutex::new(rx)));
+    Ok(h)
+}
+
+fn get_network_decision_stream(handle: Handle) -> Result<NetworkDecisionStreamEntry, FfiError> {
+    network_decision_stream_registry()
+        .read()
+        .map_err(|_| FfiError::internal("network decision stream registry lock poisoned"))?
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| FfiError::invalid_handle(handle))
+}
+
+fn remove_network_decision_stream(handle: Handle) {
+    let _ = network_decision_stream_registry()
+        .write()
+        .map(|mut r| r.remove(&handle));
+}
+
+#[derive(serde::Deserialize, Default)]
+struct NetworkDecisionOpts {
+    #[serde(default)]
+    after_sequence: u64,
+    #[serde(default)]
+    follow: bool,
+}
+
+fn parse_network_decision_options(
+    opts_json: *const c_char,
+) -> Result<microsandbox::NetworkDecisionOptions, FfiError> {
+    let raw = if opts_json.is_null() {
+        "{}".to_string()
+    } else {
+        unsafe { cstr(opts_json) }?.to_string()
+    };
+    let opts: NetworkDecisionOpts = serde_json::from_str(&raw).map_err(|e| {
+        FfiError::invalid_argument(format!("invalid network decision opts JSON: {e}"))
+    })?;
+    Ok(microsandbox::NetworkDecisionOptions {
+        after_sequence: opts.after_sequence,
+        follow: opts.follow,
+    })
+}
+
+async fn start_network_decision_stream_from_stream(
+    mut stream: microsandbox::NetworkDecisionStream,
+) -> Result<Handle, FfiError> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<NetworkDecisionStreamItem>(16);
+    tokio::spawn(async move {
+        while let Some(item) = stream.next().await {
+            if tx.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    register_network_decision_stream(rx)
+}
+
+fn network_decision_item_json(item: microsandbox::NetworkDecisionItem) -> Result<String, FfiError> {
+    match item {
+        microsandbox::NetworkDecisionItem::Event(event) => serde_json::to_string(&event)
+            .map_err(|e| FfiError::internal(format!("serialise network decision: {e}"))),
+        microsandbox::NetworkDecisionItem::End(end) => {
+            let reason = match end {
+                microsandbox::NetworkDecisionEnd::Drained => "drained",
+                microsandbox::NetworkDecisionEnd::SandboxStopped => "sandbox_stopped",
+            };
+            Ok(format!(r#"{{"done":true,"reason":"{reason}"}}"#))
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_network_decisions(
+    cancel_id: u64,
+    handle: Handle,
+    opts_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let opts = parse_network_decision_options(opts_json)?;
+        Ok(Box::pin(async move {
+            let sb = get(handle)?;
+            let snap = sb.network_decisions(opts).await.map_err(FfiError::from)?;
+            serde_json::to_string(&snap)
+                .map_err(|e| FfiError::internal(format!("serialise network decisions: {e}")))
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_network_decision_stream(
+    cancel_id: u64,
+    handle: Handle,
+    opts_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let opts = parse_network_decision_options(opts_json)?;
+        Ok(Box::pin(async move {
+            let sb = get(handle)?;
+            let stream = sb.network_decision_stream(opts);
+            let sh = start_network_decision_stream_from_stream(stream).await?;
+            Ok(format!(r#"{{"stream_handle":{sh}}}"#))
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_network_decision_recv(
+    cancel_id: u64,
+    stream_handle: Handle,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    let result: Result<(), FfiError> = (|| -> Result<(), FfiError> {
+        let token = lookup_cancel_token(cancel_id)?;
+        let entry = get_network_decision_stream(stream_handle)?;
+        let mut recv = entry
+            .try_lock()
+            .map_err(|_| FfiError::internal("network decision stream mutex busy"))?;
+        let json = rt().block_on(async {
+            tokio::select! {
+                item = recv.recv() => {
+                    match item {
+                        None => Ok(r#"{"done":true,"reason":"drained"}"#.to_string()),
+                        Some(Ok(item)) => network_decision_item_json(item),
+                        Some(Err(e)) => Err(FfiError::from(e)),
+                    }
+                }
+                _ = token.cancelled() => Err(FfiError::new(error_kind::CANCELLED, "cancelled")),
+            }
+        })?;
+        write_output(buf, buf_len, &json)
+    })();
+    cancel_unregister(cancel_id);
+    match result {
+        Ok(()) => std::ptr::null_mut(),
+        Err(e) => err_ptr(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_network_decision_close(
+    stream_handle: Handle,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run(buf, buf_len, || {
+        remove_network_decision_stream(stream_handle);
+        Ok(r#"{"ok":true}"#.into())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Exec streaming
 //
 // msb_sandbox_exec_stream — starts a streaming exec, returns an exec handle.

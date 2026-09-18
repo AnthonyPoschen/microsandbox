@@ -129,6 +129,11 @@ pub struct LaunchConfig {
     #[cfg(feature = "net")]
     pub sandbox_slot: u16,
 
+    /// Per-sandbox network-decision ring-buffer capacity.
+    #[cfg(feature = "net")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_decision_buffer_capacity: Option<usize>,
+
     /// Host Unix sockets exposed through virtio-vsock.
     #[serde(default)]
     pub vsock: Vec<VsockRouteSpec>,

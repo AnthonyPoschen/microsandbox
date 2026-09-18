@@ -313,6 +313,15 @@ pub enum EgressEvaluation {
     DeferUntilHttp,
 }
 
+/// Egress evaluation plus a stable description of the matched rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDecision {
+    /// Allow, deny, or a deferred state.
+    pub evaluation: EgressEvaluation,
+    /// `rule[N] …` or `default_egress`.
+    pub matched_rule: String,
+}
+
 /// HTTP/1 request-line context for [`Rule::methods`] / [`Rule::paths`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpRequestMatch<'a> {
@@ -418,6 +427,7 @@ impl NetworkPolicy {
             HostnameSource::CacheOnly,
             HttpRequestMatch::NotHttp,
         )
+        .evaluation
         .into()
     }
 
@@ -438,6 +448,7 @@ impl NetworkPolicy {
             HostnameSource::CacheOnly,
             HttpRequestMatch::NotHttp,
         )
+        .evaluation
         .into()
     }
 
@@ -494,6 +505,20 @@ impl NetworkPolicy {
         source: HostnameSource<'_>,
         http: HttpRequestMatch<'_>,
     ) -> EgressEvaluation {
+        self.evaluate_egress_http_decision(dst, protocol, shared, source, http)
+            .evaluation
+    }
+
+    /// Same walk as [`Self::evaluate_egress_http`], including the matched
+    /// rule description used by the decision log.
+    pub fn evaluate_egress_http_decision(
+        &self,
+        dst: SocketAddr,
+        protocol: Protocol,
+        shared: &SharedState,
+        source: HostnameSource<'_>,
+        http: HttpRequestMatch<'_>,
+    ) -> PolicyDecision {
         self.egress_walk(dst.ip(), Some(dst.port()), protocol, shared, source, http)
     }
 
@@ -546,7 +571,7 @@ impl NetworkPolicy {
         shared: &SharedState,
         source: HostnameSource<'_>,
         http: HttpRequestMatch<'_>,
-    ) -> EgressEvaluation {
+    ) -> PolicyDecision {
         for (idx, rule) in self.rules.iter().enumerate() {
             if !matches!(rule.direction, Direction::Egress | Direction::Any) {
                 continue;
@@ -570,9 +595,19 @@ impl NetworkPolicy {
                 source,
             ) {
                 DestinationMatch::Match => match http_filter_match(rule, http) {
-                    HttpFilterMatch::Match => return rule.action.into(),
+                    HttpFilterMatch::Match => {
+                        return PolicyDecision {
+                            evaluation: rule.action.into(),
+                            matched_rule: rule.match_description(idx),
+                        };
+                    }
                     HttpFilterMatch::NoMatch => continue,
-                    HttpFilterMatch::Defer => return EgressEvaluation::DeferUntilHttp,
+                    HttpFilterMatch::Defer => {
+                        return PolicyDecision {
+                            evaluation: EgressEvaluation::DeferUntilHttp,
+                            matched_rule: rule.match_description(idx),
+                        };
+                    }
                 },
                 DestinationMatch::Defer => {
                     if rule.action.is_deny()
@@ -585,14 +620,23 @@ impl NetworkPolicy {
                             http,
                         )
                     {
-                        return EgressEvaluation::Deny;
+                        return PolicyDecision {
+                            evaluation: EgressEvaluation::Deny,
+                            matched_rule: rule.match_description(idx),
+                        };
                     }
-                    return EgressEvaluation::DeferUntilHostname;
+                    return PolicyDecision {
+                        evaluation: EgressEvaluation::DeferUntilHostname,
+                        matched_rule: rule.match_description(idx),
+                    };
                 }
                 DestinationMatch::NoMatch => continue,
             }
         }
-        self.default_egress.into()
+        PolicyDecision {
+            evaluation: self.default_egress.into(),
+            matched_rule: "default_egress".into(),
+        }
     }
 
     /// Return whether the rules after a deferred deny-domain rule could
@@ -704,23 +748,25 @@ impl NetworkPolicy {
     /// protocol and port. If no rule matches, `default_egress`
     /// applies.
     pub fn evaluate_dns_query(&self, name: &DomainName, protocol: Protocol, port: u16) -> Action {
-        self.evaluate_dns_query_inner(Some(name), protocol, port)
+        self.evaluate_dns_query_decision(Some(name), protocol, port)
+            .0
     }
 
     /// Evaluate a DNS query whose name cannot be represented as a
     /// [`DomainName`]. Only `Any` rules can match; otherwise the egress
     /// default applies.
     pub fn evaluate_dns_query_without_name(&self, protocol: Protocol, port: u16) -> Action {
-        self.evaluate_dns_query_inner(None, protocol, port)
+        self.evaluate_dns_query_decision(None, protocol, port).0
     }
 
-    fn evaluate_dns_query_inner(
+    /// DNS query evaluation plus the matched-rule description.
+    pub fn evaluate_dns_query_decision(
         &self,
         name: Option<&DomainName>,
         protocol: Protocol,
         port: u16,
-    ) -> Action {
-        for rule in &self.rules {
+    ) -> (Action, String) {
+        for (idx, rule) in self.rules.iter().enumerate() {
             if !matches!(rule.direction, Direction::Egress | Direction::Any) {
                 continue;
             }
@@ -739,10 +785,10 @@ impl NetworkPolicy {
                 _ => false,
             };
             if matched {
-                return rule.action;
+                return (rule.action, rule.match_description(idx));
             }
         }
-        self.default_egress
+        (self.default_egress, "default_egress".into())
     }
 
     /// Single-name sugar over [`Self::deny_domains`].
@@ -974,6 +1020,77 @@ impl Rule {
     /// True when this rule constrains HTTP method or path.
     pub fn has_http_filters(&self) -> bool {
         !self.methods.is_empty() || !self.paths.is_empty()
+    }
+
+    /// Stable description used in network-decision events.
+    pub fn match_description(&self, index: usize) -> String {
+        let action = match self.action {
+            Action::Allow => "allow",
+            Action::Deny => "deny",
+        };
+        let direction = match self.direction {
+            Direction::Egress => "egress",
+            Direction::Ingress => "ingress",
+            Direction::Any => "any",
+        };
+        let dest = match &self.destination {
+            Destination::Any => "any".to_string(),
+            Destination::Cidr(network) => format!("cidr:{network}"),
+            Destination::Domain(name) => format!("domain:{}", name.as_str()),
+            Destination::DomainSuffix(name) => format!("suffix:{}", name.as_str()),
+            Destination::Group(group) => format!(
+                "group:{}",
+                match group {
+                    DestinationGroup::Public => "public",
+                    DestinationGroup::Loopback => "loopback",
+                    DestinationGroup::Private => "private",
+                    DestinationGroup::LinkLocal => "link_local",
+                    DestinationGroup::Metadata => "metadata",
+                    DestinationGroup::Multicast => "multicast",
+                    DestinationGroup::Host => "host",
+                }
+            ),
+        };
+        let mut desc = format!("rule[{index}] {action} {direction} {dest}");
+        if !self.protocols.is_empty() {
+            let protocols: Vec<&str> = self
+                .protocols
+                .iter()
+                .map(|protocol| match protocol {
+                    Protocol::Tcp => "tcp",
+                    Protocol::Udp => "udp",
+                    Protocol::Icmpv4 => "icmpv4",
+                    Protocol::Icmpv6 => "icmpv6",
+                })
+                .collect();
+            desc.push(' ');
+            desc.push_str(&protocols.join(","));
+        }
+        if !self.ports.is_empty() {
+            let ports: Vec<String> = self
+                .ports
+                .iter()
+                .map(|range| {
+                    if range.start == range.end {
+                        range.start.to_string()
+                    } else {
+                        format!("{}-{}", range.start, range.end)
+                    }
+                })
+                .collect();
+            desc.push(':');
+            desc.push_str(&ports.join(","));
+        }
+        if !self.methods.is_empty() {
+            let methods: Vec<&str> = self.methods.iter().map(|method| method.as_str()).collect();
+            desc.push_str(" methods:");
+            desc.push_str(&methods.join(","));
+        }
+        if !self.paths.is_empty() {
+            desc.push_str(" paths:");
+            desc.push_str(&self.paths.join(","));
+        }
+        desc
     }
 
     /// Allow plain DNS (UDP/53 and TCP/53) to the sandbox gateway, i.e.

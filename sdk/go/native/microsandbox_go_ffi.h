@@ -514,6 +514,25 @@ char *msb_log_recv(uint64_t cancel_id, Handle stream_handle, unsigned char *buf,
  */
 char *msb_log_close(Handle stream_handle, unsigned char *buf, uintptr_t buf_len);
 
+char *msb_sandbox_network_decisions(uint64_t cancel_id,
+                                    Handle handle,
+                                    const char *opts_json,
+                                    unsigned char *buf,
+                                    uintptr_t buf_len);
+
+char *msb_sandbox_network_decision_stream(uint64_t cancel_id,
+                                          Handle handle,
+                                          const char *opts_json,
+                                          unsigned char *buf,
+                                          uintptr_t buf_len);
+
+char *msb_network_decision_recv(uint64_t cancel_id,
+                                Handle stream_handle,
+                                unsigned char *buf,
+                                uintptr_t buf_len);
+
+char *msb_network_decision_close(Handle stream_handle, unsigned char *buf, uintptr_t buf_len);
+
 /**
  * Start a streaming exec session. Returns `{"exec_handle":<u64>}`.
  * The exec handle MUST be released with msb_exec_close when done.

@@ -16,6 +16,8 @@ mod identity;
 pub mod init;
 pub(crate) mod metrics;
 mod modify;
+#[cfg(feature = "net")]
+pub(crate) mod network_decisions;
 mod patch;
 #[cfg(windows)]
 mod reap;
@@ -149,6 +151,10 @@ pub use modify::{
     ResourceResizeStatus, SandboxModificationBuilder, SandboxModificationPatch,
     SandboxModificationPlan, SecretChangeKind, SecretModificationPatch, SecretPatchBuilder,
     SecretPlannedChange, SecretSource,
+};
+#[cfg(feature = "net")]
+pub use network_decisions::{
+    NetworkDecisionEnd, NetworkDecisionItem, NetworkDecisionOptions, NetworkDecisionStream,
 };
 #[cfg(feature = "ssh")]
 pub use ssh::{

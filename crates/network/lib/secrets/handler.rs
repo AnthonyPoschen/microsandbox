@@ -16,6 +16,7 @@ use percent_encoding::percent_decode;
 use super::config::{
     HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretsConfig, ViolationAction,
 };
+use crate::decision::emit_http;
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol};
 
@@ -110,6 +111,8 @@ pub struct SecretsHandler {
     unsupported_body_tail: Vec<u8>,
     /// HTTP/2 parser/rewriter state once an HTTP/2 preface is observed.
     http2_state: Option<Http2State>,
+    /// Correlation identifier shared with TCP/TLS events.
+    correlation_id: Option<String>,
 }
 
 /// HTTP request framing state for the guest→server byte stream.
@@ -221,6 +224,7 @@ struct HttpPolicyContext {
     guest_dst: SocketAddr,
     network_policy: Arc<NetworkPolicy>,
     shared: Arc<SharedState>,
+    correlation_id: Option<String>,
 }
 
 /// Parsed HTTP/1 request metadata needed for validation and framing.
@@ -717,7 +721,14 @@ impl SecretsHandler {
             http_pending: Vec::new(),
             unsupported_body_tail: Vec::new(),
             http2_state: None,
+            correlation_id: None,
         }
+    }
+
+    /// Attach a correlation identifier for HTTP decision events.
+    pub(crate) fn with_correlation_id(mut self, correlation_id: Option<String>) -> Self {
+        self.correlation_id = correlation_id;
+        self
     }
 
     /// Attach the original guest destination for structured violation logs.
@@ -741,6 +752,7 @@ impl SecretsHandler {
                 guest_dst,
                 network_policy,
                 shared,
+                correlation_id: self.correlation_id.clone(),
             });
         }
         self
@@ -2141,13 +2153,15 @@ fn validate_http1_authority(
                 Some(name) => HostnameSource::Sni(name),
                 None => HostnameSource::CacheOnly,
             };
-            match network_policy.evaluate_egress_http(
+            let decision = network_policy.evaluate_egress_http_decision(
                 *guest_dst,
                 Protocol::Tcp,
                 shared,
                 source,
                 http,
-            ) {
+            );
+            emit_http(shared, &decision, *guest_dst, host, None, None);
+            match decision.evaluation {
                 EgressEvaluation::Allow => Ok(()),
                 EgressEvaluation::Deny
                 | EgressEvaluation::DeferUntilHostname
@@ -2225,13 +2239,26 @@ fn evaluate_http_policy(
     source: HostnameSource<'_>,
     http: HttpRequestMatch<'_>,
 ) -> Result<(), ViolationAction> {
-    match ctx.network_policy.evaluate_egress_http(
+    let decision = ctx.network_policy.evaluate_egress_http_decision(
         ctx.guest_dst,
         Protocol::Tcp,
         &ctx.shared,
         source,
         http,
-    ) {
+    );
+    let authority = match source {
+        HostnameSource::Sni(name) => Some(name.to_string()),
+        HostnameSource::CacheOnly | HostnameSource::Deferred => None,
+    };
+    emit_http(
+        &ctx.shared,
+        &decision,
+        ctx.guest_dst,
+        authority.clone(),
+        authority,
+        ctx.correlation_id.clone(),
+    );
+    match decision.evaluation {
         EgressEvaluation::Allow => Ok(()),
         EgressEvaluation::Deny
         | EgressEvaluation::DeferUntilHostname
@@ -2273,13 +2300,22 @@ fn validate_authority(
             };
             let hostname = hostname.to_ascii_lowercase();
             let authority_dst = SocketAddr::new(guest_dst.ip(), guest_dst.port());
-            match network_policy.evaluate_egress_http(
+            let decision = network_policy.evaluate_egress_http_decision(
                 authority_dst,
                 Protocol::Tcp,
                 shared,
                 HostnameSource::Sni(&hostname),
                 http,
-            ) {
+            );
+            emit_http(
+                shared,
+                &decision,
+                authority_dst,
+                Some(hostname.clone()),
+                None,
+                None,
+            );
+            match decision.evaluation {
                 EgressEvaluation::Allow => Ok(()),
                 EgressEvaluation::Deny
                 | EgressEvaluation::DeferUntilHostname
