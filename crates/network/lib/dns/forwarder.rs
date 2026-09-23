@@ -293,7 +293,7 @@ impl DnsForwarder {
         // the DNS protocol/port.
         let (dns_action, matched_rule) =
             decide_dns_action(&self.network_policy, &domain, transport);
-        let correlation_id = self.shared.next_correlation_id("dns");
+        let (correlation_id, lookup_id) = self.shared.begin_dns_lookup(&domain);
         emit_dns(
             self.shared.decisions(),
             dns_action,
@@ -302,6 +302,7 @@ impl DnsForwarder {
             transport.policy_protocol(),
             transport.upstream_port(),
             Some(correlation_id),
+            Some(lookup_id.clone()),
         );
         if dns_action.is_deny() {
             tracing::debug!(domain = %domain, "DNS query denied by network policy");
@@ -395,6 +396,8 @@ impl DnsForwarder {
             if let Some((addrs, ttl)) = extract_addrs_and_ttl(&response_msg, family, &domain) {
                 self.shared
                     .cache_resolved_hostname(&domain, family, addrs, ttl);
+                self.shared
+                    .cache_resolved_lookup(&domain, family, &lookup_id, ttl);
             } else {
                 self.shared.clear_resolved_hostname(&domain, family);
             }

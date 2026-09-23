@@ -747,6 +747,8 @@ Composable profile names accepted by [`NetworkPolicy.FromProfiles()`](#networkpo
 
 Every DNS, TCP, UDP, TLS/SNI, and HTTP enforcement decision is recorded in a bounded per-sandbox ring buffer. Replay it with `Sandbox.NetworkDecisions`, or follow live events with `Sandbox.NetworkDecisionStream`. `Recv` returns `nil, nil` at end-of-stream (snapshot drained or sandbox stopped). Events never include request bodies, credentials, cookies, or TLS private material.
 
+`correlation_id` identifies one DNS query or one connection. TLS and HTTP decisions on that connection reuse it. `lookup_id` groups the DNS queries for one name with the connections that used an address from that lookup. Group rows by `lookup_id`. When a TCP event has no `lookup_id` and a later TLS or HTTP event on the same `correlation_id` has one, the connection belongs to that lookup.
+
 ```go
 snap, err := sb.NetworkDecisions(ctx, m.NetworkDecisionOptions{})
 stream, err := sb.NetworkDecisionStream(ctx, m.NetworkDecisionOptions{Follow: true})

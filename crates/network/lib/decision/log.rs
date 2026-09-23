@@ -128,6 +128,7 @@ impl DecisionLog {
             sni: record.sni,
             http_authority: record.http_authority,
             correlation_id: record.correlation_id,
+            lookup_id: record.lookup_id,
             matched_rule: record.matched_rule,
             dropped_count: inner.dropped_count,
             earliest_retained_sequence: 0,
@@ -237,6 +238,7 @@ mod tests {
             sni: None,
             http_authority: None,
             correlation_id: Some("tcp-1".into()),
+            lookup_id: None,
             matched_rule: Some("rule[0] allow any".into()),
         }
     }

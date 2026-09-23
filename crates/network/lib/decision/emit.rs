@@ -38,6 +38,8 @@ pub struct DecisionRecord {
     pub http_authority: Option<String>,
     /// Correlation identifier.
     pub correlation_id: Option<String>,
+    /// Lookup that grouped the DNS queries and the connections using them.
+    pub lookup_id: Option<String>,
     /// Matched rule description.
     pub matched_rule: Option<String>,
 }
@@ -72,6 +74,7 @@ pub fn action_from_policy(action: Action) -> DecisionAction {
 }
 
 /// Emit a DNS query decision.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_dns(
     log: &DecisionLog,
     action: Action,
@@ -80,6 +83,7 @@ pub fn emit_dns(
     transport: Protocol,
     port: u16,
     correlation_id: Option<String>,
+    lookup_id: Option<String>,
 ) -> NetworkDecisionEvent {
     log.emit(DecisionRecord {
         phase: DecisionPhase::Dns,
@@ -93,6 +97,7 @@ pub fn emit_dns(
         sni: None,
         http_authority: None,
         correlation_id,
+        lookup_id,
         matched_rule: Some(matched_rule),
     })
 }
@@ -218,6 +223,7 @@ fn emit_connection(
         DecisionAction::Deny => Action::Deny,
         DecisionAction::Error => return None,
     };
+    let lookup_id = shared.lookup_id_for_destination(dst.ip(), host.as_deref());
     Some(shared.decisions().emit(DecisionRecord {
         phase,
         action,
@@ -230,6 +236,7 @@ fn emit_connection(
         sni,
         http_authority,
         correlation_id,
+        lookup_id,
         matched_rule: Some(decision.matched_rule.clone()),
     }))
 }
@@ -247,6 +254,8 @@ pub fn emit_error(
     sni: Option<String>,
     correlation_id: Option<String>,
 ) -> NetworkDecisionEvent {
+    let confirmed = host.as_deref().or(sni.as_deref());
+    let lookup_id = shared.lookup_id_for_destination(dst.ip(), confirmed);
     shared.decisions().emit(DecisionRecord {
         phase,
         action: DecisionAction::Error,
@@ -259,6 +268,7 @@ pub fn emit_error(
         sni,
         http_authority: None,
         correlation_id,
+        lookup_id,
         matched_rule: None,
     })
 }
@@ -304,10 +314,12 @@ mod tests {
             Protocol::Udp,
             53,
             Some("dns-1".into()),
+            Some("dns-1".into()),
         );
         assert_eq!(allow.phase, DecisionPhase::Dns);
         assert_eq!(allow.reason, "policy_allow");
         assert_eq!(allow.correlation_id.as_deref(), Some("dns-1"));
+        assert_eq!(allow.lookup_id.as_deref(), Some("dns-1"));
         let deny = emit_dns(
             &log,
             Action::Deny,
@@ -316,6 +328,7 @@ mod tests {
             Protocol::Udp,
             53,
             Some("dns-2".into()),
+            None,
         );
         assert_eq!(deny.reason, "default_egress_deny");
         assert_eq!(deny.action, DecisionAction::Deny);

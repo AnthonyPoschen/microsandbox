@@ -41,6 +41,8 @@ pub struct PyNetworkDecision {
     #[pyo3(get)]
     pub correlation_id: Option<String>,
     #[pyo3(get)]
+    pub lookup_id: Option<String>,
+    #[pyo3(get)]
     pub matched_rule: Option<String>,
     #[pyo3(get)]
     pub dropped_count: u64,
@@ -128,6 +130,7 @@ pub fn convert_event(event: &microsandbox_network::NetworkDecisionEvent) -> PyNe
         sni: event.sni.clone(),
         http_authority: event.http_authority.clone(),
         correlation_id: event.correlation_id.clone(),
+        lookup_id: event.lookup_id.clone(),
         matched_rule: event.matched_rule.clone(),
         dropped_count: event.dropped_count,
         earliest_retained_sequence: event.earliest_retained_sequence,

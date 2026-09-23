@@ -4,6 +4,7 @@
 //! All inter-thread communication flows through [`SharedState`], which holds
 //! lock-free frame queues and cross-platform [`WakePipe`] notifications.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -27,6 +28,12 @@ use crate::decision::{
 
 /// Default frame queue capacity. Matches libkrun's virtio queue size.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+
+/// How long a later DNS query for the same name joins the lookup already open.
+///
+/// Parallel A and AAAA queries, and a truncated UDP answer retried over TCP,
+/// land inside this window. A query that starts after it is a new lookup.
+pub(crate) const LOOKUP_SIBLING_WINDOW: Duration = Duration::from_secs(1);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -88,6 +95,12 @@ pub struct SharedState {
 
     /// Monotonic generator for connection/request correlation ids.
     correlation_seq: AtomicU64,
+
+    /// DNS lookups opened within [`LOOKUP_SIBLING_WINDOW`], keyed by name.
+    open_lookups: Mutex<HashMap<String, OpenLookup>>,
+
+    /// Lookup id of a cached A/AAAA answer, keyed like `resolved_hostnames`.
+    resolution_lookups: RwLock<HashMap<ResolvedHostnameKey, ResolutionLookup>>,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -111,6 +124,19 @@ pub enum ResolvedHostnameFamily {
 struct ResolvedHostnameKey {
     hostname: String,
     family: ResolvedHostnameFamily,
+}
+
+/// A name lookup that sibling DNS queries can still join.
+struct OpenLookup {
+    lookup_id: String,
+    opened_at: Instant,
+}
+
+/// The lookup that produced one cached address family.
+struct ResolutionLookup {
+    lookup_id: String,
+    started_at: Instant,
+    expires_at: Instant,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -140,6 +166,8 @@ impl SharedState {
                 decision_capacity,
             )),
             correlation_seq: AtomicU64::new(0),
+            open_lookups: Mutex::new(HashMap::new()),
+            resolution_lookups: RwLock::new(HashMap::new()),
         }
     }
 
@@ -152,6 +180,116 @@ impl SharedState {
     pub fn next_correlation_id(&self, kind: &str) -> String {
         let n = self.correlation_seq.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{kind}-{n}")
+    }
+
+    /// Open or join the lookup for one DNS query name.
+    ///
+    /// Returns `(correlation_id, lookup_id)`. Queries for the same name that
+    /// start within [`LOOKUP_SIBLING_WINDOW`] share `lookup_id`. The first
+    /// query's correlation id is that lookup id.
+    pub(crate) fn begin_dns_lookup(&self, domain: &str) -> (String, String) {
+        self.begin_dns_lookup_at(domain, Instant::now())
+    }
+
+    fn begin_dns_lookup_at(&self, domain: &str, now: Instant) -> (String, String) {
+        let correlation_id = self.next_correlation_id("dns");
+        let hostname = normalize_hostname(domain);
+        let mut open = self.open_lookups.lock().expect("open lookup mutex");
+        open.retain(|_, entry| {
+            now.saturating_duration_since(entry.opened_at) <= LOOKUP_SIBLING_WINDOW
+        });
+        if let Some(existing) = open.get(&hostname) {
+            return (correlation_id, existing.lookup_id.clone());
+        }
+        let lookup_id = correlation_id.clone();
+        open.insert(
+            hostname,
+            OpenLookup {
+                lookup_id: lookup_id.clone(),
+                opened_at: now,
+            },
+        );
+        (correlation_id, lookup_id)
+    }
+
+    /// Remember which lookup produced the addresses just cached for `domain`.
+    ///
+    /// The TTL matches the resolved-hostname cache entry. A connection to one
+    /// of those addresses can then copy this lookup id onto its decision.
+    pub(crate) fn cache_resolved_lookup(
+        &self,
+        domain: &str,
+        family: ResolvedHostnameFamily,
+        lookup_id: &str,
+        ttl: Duration,
+    ) {
+        self.cache_resolved_lookup_at(domain, family, lookup_id, ttl, Instant::now());
+    }
+
+    fn cache_resolved_lookup_at(
+        &self,
+        domain: &str,
+        family: ResolvedHostnameFamily,
+        lookup_id: &str,
+        ttl: Duration,
+        now: Instant,
+    ) {
+        let hostname = normalize_hostname(domain);
+        if hostname.is_empty() || lookup_id.is_empty() {
+            return;
+        }
+        let key = ResolvedHostnameKey { hostname, family };
+        self.resolution_lookups.write().insert(
+            key,
+            ResolutionLookup {
+                lookup_id: lookup_id.to_string(),
+                started_at: now,
+                expires_at: now + ttl,
+            },
+        );
+    }
+
+    /// Lookup id for a connection to `addr`.
+    ///
+    /// `confirmed_name` is the TLS SNI or HTTP authority when that is already
+    /// known. With one cached name for the address, or with a confirmed name,
+    /// the id is that name's lookup. When several names share the address and
+    /// the name is still unknown, the id is set only when a single lookup was
+    /// cached inside [`LOOKUP_SIBLING_WINDOW`] and the others are older.
+    pub(crate) fn lookup_id_for_destination(
+        &self,
+        addr: IpAddr,
+        confirmed_name: Option<&str>,
+    ) -> Option<String> {
+        self.lookup_id_for_destination_at(addr, confirmed_name, Instant::now())
+    }
+
+    fn lookup_id_for_destination_at(
+        &self,
+        addr: IpAddr,
+        confirmed_name: Option<&str>,
+        now: Instant,
+    ) -> Option<String> {
+        let addr = normalize_ip_addr(addr);
+        let confirmed = confirmed_name.map(normalize_hostname);
+        let index = self.resolved_hostnames.read();
+        let lookups = self.resolution_lookups.read();
+        let mut candidates = Vec::new();
+        index.for_each_live_key(&addr, now, |key| {
+            if confirmed.as_ref().is_some_and(|name| name != &key.hostname) {
+                return;
+            }
+            let Some(lookup) = lookups.get(key) else {
+                return;
+            };
+            if lookup.expires_at <= now {
+                return;
+            }
+            candidates.push((lookup.lookup_id.clone(), lookup.started_at));
+        });
+        drop(lookups);
+        drop(index);
+        select_lookup_id(&candidates, confirmed.is_some(), now)
     }
 
     /// Set the per-sandbox gateway IPs. Called once at boot. Each family is
@@ -209,6 +347,7 @@ impl SharedState {
         let hostname = normalize_hostname(domain);
         let key = ResolvedHostnameKey { hostname, family };
         self.resolved_hostnames.write().remove(&key, Instant::now());
+        self.resolution_lookups.write().remove(&key);
     }
 
     /// Returns `true` when any resolved hostname for `addr` satisfies `predicate`.
@@ -229,8 +368,17 @@ impl SharedState {
     /// This runs outside the hot egress read path. If the index is currently
     /// busy, cleanup is skipped and retried on the next maintenance pass.
     pub fn cleanup_resolved_hostnames(&self) {
+        let now = Instant::now();
         if let Some(mut idx) = self.resolved_hostnames.try_write() {
-            idx.evict_expired(Instant::now());
+            idx.evict_expired(now);
+        }
+        if let Some(mut lookups) = self.resolution_lookups.try_write() {
+            lookups.retain(|_, entry| entry.expires_at > now);
+        }
+        if let Ok(mut open) = self.open_lookups.try_lock() {
+            open.retain(|_, entry| {
+                now.saturating_duration_since(entry.opened_at) <= LOOKUP_SIBLING_WINDOW
+            });
         }
     }
 
@@ -291,6 +439,48 @@ impl Default for NetworkMetrics {
 
 pub(crate) fn normalize_hostname(domain: &str) -> String {
     domain.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Pick the lookup id a connection should carry.
+///
+/// `candidates` is `(lookup_id, cached_at)` for every live name that resolved
+/// to the destination. A confirmed hostname has already discarded other names.
+fn select_lookup_id(
+    candidates: &[(String, Instant)],
+    confirmed: bool,
+    now: Instant,
+) -> Option<String> {
+    let mut by_id: Vec<(String, Instant)> = Vec::new();
+    for (id, started) in candidates {
+        if let Some((_, existing)) = by_id.iter_mut().find(|(existing_id, _)| existing_id == id) {
+            if *started > *existing {
+                *existing = *started;
+            }
+        } else {
+            by_id.push((id.clone(), *started));
+        }
+    }
+
+    if by_id.len() <= 1 {
+        return by_id.pop().map(|(id, _)| id);
+    }
+    if confirmed {
+        by_id.sort_by_key(|(_, started)| *started);
+        return by_id.pop().map(|(id, _)| id);
+    }
+
+    let mut fresh: Vec<&str> = by_id
+        .iter()
+        .filter(|(_, started)| now.saturating_duration_since(*started) <= LOOKUP_SIBLING_WINDOW)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    fresh.sort_unstable();
+    fresh.dedup();
+    if fresh.len() == 1 {
+        Some(fresh[0].to_string())
+    } else {
+        None
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -375,5 +565,215 @@ mod tests {
 
         assert!(state.any_resolved_hostname(embedded, |h| h == "metadata.example"));
         assert!(state.any_resolved_hostname(mapped, |h| h == "metadata.example"));
+    }
+
+    #[test]
+    fn sibling_dns_queries_share_lookup_id() {
+        let state = SharedState::new(4);
+        let opened = Instant::now();
+
+        let (first_query, first_lookup) = state.begin_dns_lookup_at("Example.com.", opened);
+        let (second_query, second_lookup) =
+            state.begin_dns_lookup_at("example.com", opened + Duration::from_millis(200));
+        let (later_query, later_lookup) =
+            state.begin_dns_lookup_at("example.com", opened + Duration::from_secs(2));
+
+        assert_eq!(first_lookup, first_query);
+        assert_eq!(second_lookup, first_lookup);
+        assert_ne!(second_query, first_query);
+        assert_eq!(later_lookup, later_query);
+        assert_ne!(later_lookup, first_lookup);
+    }
+
+    #[test]
+    fn lookup_id_follows_each_resolved_address() {
+        let state = SharedState::new(4);
+        let v4: IpAddr = "1.1.1.1".parse().unwrap();
+        let v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        let (v4_query, lookup) = state.begin_dns_lookup("example.com");
+        let (v6_query, v6_lookup) = state.begin_dns_lookup("example.com");
+        assert_eq!(v6_lookup, lookup);
+        assert_ne!(v4_query, v6_query);
+
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [v4],
+            Duration::from_secs(30),
+        );
+        state.cache_resolved_lookup(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            &lookup,
+            Duration::from_secs(30),
+        );
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv6,
+            [v6],
+            Duration::from_secs(30),
+        );
+        state.cache_resolved_lookup(
+            "example.com",
+            ResolvedHostnameFamily::Ipv6,
+            &lookup,
+            Duration::from_secs(30),
+        );
+
+        assert_eq!(
+            state.lookup_id_for_destination(v4, None).as_deref(),
+            Some(lookup.as_str())
+        );
+        assert_eq!(
+            state.lookup_id_for_destination(v6, None).as_deref(),
+            Some(lookup.as_str())
+        );
+        assert_eq!(
+            state.lookup_id_for_destination(v4, Some("example.com")),
+            Some(lookup)
+        );
+    }
+
+    #[test]
+    fn shared_address_stays_unlinked_until_the_name_matches() {
+        let state = SharedState::new(4);
+        let shared_ip: IpAddr = "151.101.0.223".parse().unwrap();
+        let now = Instant::now();
+
+        state.cache_resolved_hostname(
+            "a.example",
+            ResolvedHostnameFamily::Ipv4,
+            [shared_ip],
+            Duration::from_secs(60),
+        );
+        state.cache_resolved_hostname(
+            "b.example",
+            ResolvedHostnameFamily::Ipv4,
+            [shared_ip],
+            Duration::from_secs(60),
+        );
+        state.cache_resolved_lookup_at(
+            "a.example",
+            ResolvedHostnameFamily::Ipv4,
+            "dns-1",
+            Duration::from_secs(60),
+            now,
+        );
+        state.cache_resolved_lookup_at(
+            "b.example",
+            ResolvedHostnameFamily::Ipv4,
+            "dns-2",
+            Duration::from_secs(60),
+            now,
+        );
+
+        assert_eq!(
+            state.lookup_id_for_destination_at(shared_ip, None, now),
+            None
+        );
+        assert_eq!(
+            state
+                .lookup_id_for_destination_at(shared_ip, Some("B.example."), now)
+                .as_deref(),
+            Some("dns-2")
+        );
+    }
+
+    #[test]
+    fn fresh_lookup_wins_over_an_older_shared_address() {
+        let state = SharedState::new(4);
+        let shared_ip: IpAddr = "142.250.0.1".parse().unwrap();
+        let now = Instant::now();
+
+        state.cache_resolved_hostname(
+            "old.example",
+            ResolvedHostnameFamily::Ipv4,
+            [shared_ip],
+            Duration::from_secs(60),
+        );
+        state.cache_resolved_hostname(
+            "new.example",
+            ResolvedHostnameFamily::Ipv4,
+            [shared_ip],
+            Duration::from_secs(60),
+        );
+        state.cache_resolved_lookup_at(
+            "old.example",
+            ResolvedHostnameFamily::Ipv4,
+            "dns-old",
+            Duration::from_secs(60),
+            now - Duration::from_secs(30),
+        );
+        state.cache_resolved_lookup_at(
+            "new.example",
+            ResolvedHostnameFamily::Ipv4,
+            "dns-new",
+            Duration::from_secs(60),
+            now,
+        );
+
+        assert_eq!(
+            state
+                .lookup_id_for_destination_at(shared_ip, None, now)
+                .as_deref(),
+            Some("dns-new")
+        );
+        assert_eq!(
+            state
+                .lookup_id_for_destination_at(shared_ip, Some("old.example"), now)
+                .as_deref(),
+            Some("dns-old")
+        );
+    }
+
+    #[test]
+    fn expired_lookup_is_not_reused() {
+        let state = SharedState::new(4);
+        let addr: IpAddr = "1.2.3.4".parse().unwrap();
+        let now = Instant::now();
+
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [addr],
+            Duration::from_secs(60),
+        );
+        state.cache_resolved_lookup_at(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            "dns-1",
+            Duration::from_secs(1),
+            now - Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            state.lookup_id_for_destination_at(addr, Some("example.com"), now),
+            None
+        );
+    }
+
+    #[test]
+    fn clearing_a_resolution_drops_its_lookup() {
+        let state = SharedState::new(4);
+        let addr: IpAddr = "1.2.3.4".parse().unwrap();
+
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [addr],
+            Duration::from_secs(60),
+        );
+        state.cache_resolved_lookup(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            "dns-1",
+            Duration::from_secs(60),
+        );
+        state.clear_resolved_hostname("example.com", ResolvedHostnameFamily::Ipv4);
+
+        assert_eq!(
+            state.lookup_id_for_destination(addr, Some("example.com")),
+            None
+        );
     }
 }

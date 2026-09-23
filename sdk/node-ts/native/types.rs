@@ -47,6 +47,7 @@ pub struct JsNetworkDecision {
     pub sni: Option<String>,
     pub http_authority: Option<String>,
     pub correlation_id: Option<String>,
+    pub lookup_id: Option<String>,
     pub matched_rule: Option<String>,
     pub dropped_count: f64,
     pub earliest_retained_sequence: f64,

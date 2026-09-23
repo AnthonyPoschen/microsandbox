@@ -86,9 +86,19 @@ pub struct NetworkDecisionEvent {
     /// HTTP authority (`Host` / `:authority`) when inspected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_authority: Option<String>,
-    /// Connection or request correlation identifier.
+    /// Identifier of one DNS query or one TCP/UDP flow.
+    ///
+    /// TLS and HTTP decisions on the same socket reuse the flow's id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    /// Identifier shared by the DNS queries for one name lookup and by the
+    /// connections that used an address from that lookup.
+    ///
+    /// Absent when the destination was not learned from a single current
+    /// lookup. A later TLS or HTTP event on the same `correlation_id` can
+    /// carry the id once the hostname is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_id: Option<String>,
     /// Matched rule identifier or stable policy-match description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<String>,
@@ -195,6 +205,7 @@ mod tests {
             sni: Some("api.example.com".into()),
             http_authority: Some("api.example.com".into()),
             correlation_id: Some("tcp-1".into()),
+            lookup_id: Some("dns-1".into()),
             matched_rule: Some("rule[0] allow domain:api.example.com".into()),
             dropped_count: 0,
             earliest_retained_sequence: 1,
@@ -218,5 +229,28 @@ mod tests {
         }
         assert!(json.contains("\"phase\":\"http\""));
         assert!(json.contains("\"action\":\"allow\""));
+        assert!(json.contains("\"lookup_id\":\"dns-1\""));
+    }
+
+    #[test]
+    fn event_without_lookup_id_deserializes() {
+        let json = r#"{
+            "sequence": 1,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "phase": "dns",
+            "action": "allow",
+            "reason": "policy_allow",
+            "destination_host": "example.com",
+            "destination_port": 53,
+            "transport": "udp",
+            "protocol": "dns",
+            "correlation_id": "dns-1",
+            "matched_rule": "default_egress",
+            "dropped_count": 0,
+            "earliest_retained_sequence": 1
+        }"#;
+        let event: NetworkDecisionEvent = serde_json::from_str(json).expect("event json");
+        assert_eq!(event.lookup_id, None);
+        assert_eq!(event.correlation_id.as_deref(), Some("dns-1"));
     }
 }

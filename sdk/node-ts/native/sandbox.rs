@@ -843,6 +843,7 @@ fn js_network_decision(event: &microsandbox_network::NetworkDecisionEvent) -> Js
         sni: event.sni.clone(),
         http_authority: event.http_authority.clone(),
         correlation_id: event.correlation_id.clone(),
+        lookup_id: event.lookup_id.clone(),
         matched_rule: event.matched_rule.clone(),
         dropped_count: event.dropped_count as f64,
         earliest_retained_sequence: event.earliest_retained_sequence as f64,
