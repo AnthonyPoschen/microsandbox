@@ -181,6 +181,19 @@ class Protocol(StrEnum):
     ICMPV6 = "icmpv6"
 
 
+class HttpMethod(StrEnum):
+    GET = "GET"
+    HEAD = "HEAD"
+    POST = "POST"
+    PUT = "PUT"
+    DELETE = "DELETE"
+    CONNECT = "CONNECT"
+    OPTIONS = "OPTIONS"
+    TRACE = "TRACE"
+    PATCH = "PATCH"
+    QUERY = "QUERY"
+
+
 class PortProtocol(StrEnum):
     TCP = "tcp"
     UDP = "udp"
@@ -1273,6 +1286,8 @@ class Rule:
     destination: NetworkDestinationLike = None
     protocol: Protocol | None = None
     port: int | str | None = None
+    methods: tuple[HttpMethod, ...] = ()
+    paths: tuple[str, ...] = ()
 
     @classmethod
     def allow(
@@ -1282,8 +1297,18 @@ class Rule:
         protocol: Protocol | None = None,
         port: int | str | None = None,
         destination: NetworkDestinationLike = None,
+        methods: Iterable[HttpMethod] = (),
+        paths: Iterable[str] = (),
     ) -> Rule:
-        return cls(Action.ALLOW, direction, destination, protocol, port)
+        return cls(
+            Action.ALLOW,
+            direction,
+            destination,
+            protocol,
+            port,
+            tuple(methods),
+            tuple(paths),
+        )
 
     @classmethod
     def deny(
@@ -1293,8 +1318,18 @@ class Rule:
         protocol: Protocol | None = None,
         port: int | str | None = None,
         destination: NetworkDestinationLike = None,
+        methods: Iterable[HttpMethod] = (),
+        paths: Iterable[str] = (),
     ) -> Rule:
-        return cls(Action.DENY, direction, destination, protocol, port)
+        return cls(
+            Action.DENY,
+            direction,
+            destination,
+            protocol,
+            port,
+            tuple(methods),
+            tuple(paths),
+        )
 
     @classmethod
     def allow_dns(cls) -> tuple[Rule, Rule]:
@@ -1420,6 +1455,17 @@ class NetworkPolicy:
                         else {}
                     ),
                     **({"port": str(r.port)} if r.port is not None else {}),
+                    **(
+                        {
+                            "methods": [
+                                _enum_value(method, HttpMethod, "Rule.methods")
+                                for method in r.methods
+                            ]
+                        }
+                        if r.methods
+                        else {}
+                    ),
+                    **({"paths": list(r.paths)} if r.paths else {}),
                 }
                 for r in self.rules
             ]

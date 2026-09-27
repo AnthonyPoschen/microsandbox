@@ -109,6 +109,8 @@ struct Connection {
     proxy_spawned: bool,
     /// Status reported by the proxy task before it exits.
     proxy_connect: Arc<ProxyConnectState>,
+    /// Correlation identifier shared by TCP, TLS, and HTTP events.
+    correlation_id: String,
     /// Partial data from proxy that couldn't be fully written to smoltcp socket.
     write_buf: Option<(Bytes, usize)>,
     /// Data read from smoltcp socket that couldn't be sent to proxy (channel full).
@@ -140,6 +142,8 @@ pub struct NewConnection {
     pub to_smoltcp: mpsc::Sender<Bytes>,
     /// Status the proxy task updates before it exits.
     pub proxy_connect: Arc<ProxyConnectState>,
+    /// Correlation identifier shared by TCP, TLS, and HTTP events.
+    pub correlation_id: String,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -232,6 +236,17 @@ impl ConnectionTracker {
         dst: SocketAddr,
         sockets: &mut SocketSet<'_>,
     ) -> bool {
+        self.create_tcp_socket_correlated(src, dst, sockets, String::new())
+    }
+
+    /// Create a socket and attach a correlation identifier for decision events.
+    pub fn create_tcp_socket_correlated(
+        &mut self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        sockets: &mut SocketSet<'_>,
+        correlation_id: String,
+    ) -> bool {
         if self.connections.len() >= self.max_connections {
             self.rejected_connections = self.rejected_connections.saturating_add(1);
             return false;
@@ -276,6 +291,7 @@ impl ConnectionTracker {
                 }),
                 proxy_spawned: false,
                 proxy_connect: Arc::new(ProxyConnectState::new()),
+                correlation_id,
                 write_buf: None,
                 read_buf: None,
                 close_attempts: 0,
@@ -414,6 +430,7 @@ impl ConnectionTracker {
                         from_smoltcp: channels.from_smoltcp,
                         to_smoltcp: channels.to_smoltcp,
                         proxy_connect: conn.proxy_connect.clone(),
+                        correlation_id: conn.correlation_id.clone(),
                     });
                 }
             }

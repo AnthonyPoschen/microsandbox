@@ -289,6 +289,10 @@ pub enum Operation {
     SandboxMetrics,
     /// `Sandbox::metrics_stream`.
     SandboxMetricsStream,
+    /// `Sandbox::network_decisions`.
+    SandboxNetworkDecisions,
+    /// `Sandbox::network_decision_stream`.
+    SandboxNetworkDecisionStream,
     /// `Sandbox::modify`.
     SandboxModify,
     /// `Sandbox::fs`.
@@ -441,6 +445,8 @@ impl Operation {
             Operation::SandboxLogger => "Sandbox::logger",
             Operation::SandboxMetrics => "Sandbox::metrics",
             Operation::SandboxMetricsStream => "Sandbox::metrics_stream",
+            Operation::SandboxNetworkDecisions => "Sandbox::network_decisions",
+            Operation::SandboxNetworkDecisionStream => "Sandbox::network_decision_stream",
             Operation::SandboxModify => "Sandbox::modify",
             Operation::SandboxFs => "Sandbox::fs",
             Operation::AllSandboxMetrics => "all_sandbox_metrics",

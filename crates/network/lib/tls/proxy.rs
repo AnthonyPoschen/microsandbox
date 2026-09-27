@@ -17,8 +17,9 @@ use tokio::sync::mpsc;
 
 use super::sni;
 use super::state::TlsState;
+use crate::decision::{DecisionPhase, emit_error, emit_tls};
 use crate::netstack::shared::SharedState;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::{EgressEvaluation, HostnameSource, HttpRequestMatch, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::config::ViolationAction;
 use crate::secrets::handler::SecretsHandler;
@@ -58,6 +59,8 @@ pub(crate) struct TlsProxy {
     via_connect: bool,
     /// ClientHello bytes already consumed from the guest stream.
     initial_buf: Vec<u8>,
+    /// Correlation identifier shared with TCP/HTTP events.
+    correlation_id: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -94,7 +97,16 @@ impl TlsProxy {
             expected_sni: None,
             via_connect: false,
             initial_buf: Vec::new(),
+            correlation_id: None,
         }
+    }
+
+    /// Attach a correlation identifier shared with TCP/HTTP events.
+    pub(crate) fn with_correlation_id(mut self, correlation_id: String) -> Self {
+        if !correlation_id.is_empty() {
+            self.correlation_id = Some(correlation_id);
+        }
+        self
     }
 
     /// Reuse an already connected upstream stream.
@@ -151,6 +163,7 @@ impl TlsProxy {
             expected_sni,
             via_connect,
             initial_buf,
+            correlation_id,
         } = self;
         let connect_dst = connect_target.primary();
 
@@ -160,9 +173,41 @@ impl TlsProxy {
             std::time::Duration::from_secs(10),
             extract_sni_from_channel(&mut from_smoltcp, initial_buf),
         )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SNI extraction timed out"))?;
-        let (sni_name, initial_buf) = sni_name?;
+        .await;
+        let (sni_name, initial_buf) = match sni_name {
+            Ok(Ok(extracted)) => extracted,
+            Ok(Err(error)) => {
+                emit_error(
+                    &shared,
+                    DecisionPhase::Tls,
+                    "sni_extract_failed",
+                    guest_dst,
+                    "tcp",
+                    Some("tls"),
+                    None,
+                    None,
+                    correlation_id.clone(),
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                emit_error(
+                    &shared,
+                    DecisionPhase::Tls,
+                    "sni_timeout",
+                    guest_dst,
+                    "tcp",
+                    Some("tls"),
+                    None,
+                    None,
+                    correlation_id.clone(),
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "SNI extraction timed out",
+                ));
+            }
+        };
 
         // Canonicalize so byte equality against rule destinations works.
         let sni_name = sni_name.trim_end_matches('.').to_ascii_lowercase();
@@ -176,30 +221,55 @@ impl TlsProxy {
                 dst = %connect_dst,
                 "TLS SNI did not match CONNECT authority",
             );
-            proxy_connect.mark_policy_denied();
-            shared.proxy_wake.wake();
-            return Ok(());
-        }
-
-        // Apply Domain / DomainSuffix rules against the SNI.
-        let eval = network_policy.evaluate_egress_with_source(
-            guest_dst,
-            Protocol::Tcp,
-            &shared,
-            HostnameSource::Sni(&sni_name),
-        );
-        if !matches!(eval, EgressEvaluation::Allow) {
-            tracing::debug!(
-                sni = %sni_name,
-                dst = %guest_dst,
-                "TLS egress denied by domain policy",
+            emit_error(
+                &shared,
+                DecisionPhase::Tls,
+                "sni_mismatch",
+                guest_dst,
+                "tcp",
+                Some("tls"),
+                Some(sni_name.clone()),
+                Some(sni_name.clone()),
+                correlation_id.clone(),
             );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();
             return Ok(());
         }
 
+        // Apply Domain / DomainSuffix rules against the SNI. Method/path
+        // filters cannot be decided from SNI; intercepted connections
+        // defer those until the decrypted request line.
+        let decision = network_policy.evaluate_egress_http_decision(
+            guest_dst,
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Sni(&sni_name),
+            tls_sni_http_context(&network_policy),
+        );
+        let eval = decision.evaluation;
         let should_bypass = tls_state.should_bypass(&sni_name);
+        if !tls_sni_eval_permits_connection(eval, should_bypass) {
+            tracing::debug!(
+                sni = %sni_name,
+                dst = %guest_dst,
+                bypass = should_bypass,
+                ?eval,
+                "TLS egress denied by domain policy",
+            );
+            emit_tls(
+                &shared,
+                &decision,
+                guest_dst,
+                &sni_name,
+                correlation_id.clone(),
+                None,
+            );
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
+
         if strict
             && should_bypass
             && network_policy.allows_egress_via_hostname(
@@ -214,10 +284,29 @@ impl TlsProxy {
                 dst = %guest_dst,
                 "TLS bypass denied by strict hostname policy",
             );
+            emit_error(
+                &shared,
+                DecisionPhase::Tls,
+                "strict_hostname_deny",
+                guest_dst,
+                "tcp",
+                Some("tls"),
+                Some(sni_name.clone()),
+                Some(sni_name.clone()),
+                correlation_id.clone(),
+            );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();
             return Ok(());
         }
+        emit_tls(
+            &shared,
+            &decision,
+            guest_dst,
+            &sni_name,
+            correlation_id.clone(),
+            None,
+        );
 
         if should_bypass {
             tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
@@ -240,10 +329,12 @@ impl TlsProxy {
                 &sni_name,
                 via_connect,
                 initial_buf,
+                correlation_id.clone(),
                 from_smoltcp,
                 to_smoltcp,
                 shared,
                 tls_state,
+                network_policy,
                 proxy_connect,
                 upstream_stream,
                 outbound_proxy,
@@ -256,6 +347,29 @@ impl TlsProxy {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// HTTP classification used at SNI time. Method/path filters defer
+/// until the request is decrypted; otherwise TLS is not HTTP.
+fn tls_sni_http_context(policy: &NetworkPolicy) -> HttpRequestMatch<'static> {
+    if policy.has_http_filters() {
+        HttpRequestMatch::Unknown
+    } else {
+        HttpRequestMatch::NotHttp
+    }
+}
+
+/// Whether a TLS connection may continue after SNI evaluation.
+///
+/// `DeferUntilHttp` is only safe when the connection will be intercepted
+/// so method/path can be checked on the decrypted request. Bypass cannot
+/// see the request line, so it fails closed.
+fn tls_sni_eval_permits_connection(eval: EgressEvaluation, bypass: bool) -> bool {
+    match eval {
+        EgressEvaluation::Allow => true,
+        EgressEvaluation::DeferUntilHttp => !bypass,
+        EgressEvaluation::Deny | EgressEvaluation::DeferUntilHostname => false,
+    }
+}
 
 /// Bypass mode: plain TCP splice, no TLS termination.
 #[allow(clippy::too_many_arguments)]
@@ -324,10 +438,12 @@ pub(crate) async fn intercept_relay(
     sni_name: &str,
     via_connect: bool,
     initial_buf: Vec<u8>,
+    correlation_id: Option<String>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     tls_state: Arc<TlsState>,
+    network_policy: Arc<NetworkPolicy>,
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
@@ -339,7 +455,10 @@ pub(crate) async fn intercept_relay(
     } else {
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
-    .with_guest_dst(guest_dst);
+    .with_guest_dst(guest_dst)
+    .with_correlation_id(correlation_id.clone())
+    .with_http_policy(network_policy, guest_dst, shared.clone());
+    // correlation is attached below when intercept_relay gains the id.
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -599,4 +718,70 @@ async fn flush_to_guest(
         }
     }
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Action, Destination, Direction, HttpMethod, Protocol, Rule};
+
+    fn method_path_policy() -> NetworkPolicy {
+        NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: Direction::Egress,
+                destination: Destination::Any,
+                protocols: vec![Protocol::Tcp],
+                ports: Vec::new(),
+                methods: vec![HttpMethod::Get],
+                paths: vec!["/allowed".into()],
+                action: Action::Allow,
+            }],
+        }
+    }
+
+    #[test]
+    fn sni_context_defers_when_method_path_filters_exist() {
+        assert_eq!(
+            tls_sni_http_context(&method_path_policy()),
+            HttpRequestMatch::Unknown
+        );
+        assert_eq!(
+            tls_sni_http_context(&NetworkPolicy::allow_all()),
+            HttpRequestMatch::NotHttp
+        );
+    }
+
+    #[test]
+    fn deferred_http_eval_fails_closed_on_tls_bypass() {
+        assert!(tls_sni_eval_permits_connection(
+            EgressEvaluation::Allow,
+            true
+        ));
+        assert!(tls_sni_eval_permits_connection(
+            EgressEvaluation::Allow,
+            false
+        ));
+        assert!(tls_sni_eval_permits_connection(
+            EgressEvaluation::DeferUntilHttp,
+            false
+        ));
+        assert!(!tls_sni_eval_permits_connection(
+            EgressEvaluation::DeferUntilHttp,
+            true
+        ));
+        assert!(!tls_sni_eval_permits_connection(
+            EgressEvaluation::Deny,
+            false
+        ));
+        assert!(!tls_sni_eval_permits_connection(
+            EgressEvaluation::DeferUntilHostname,
+            false
+        ));
+    }
 }

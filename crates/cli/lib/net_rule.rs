@@ -250,6 +250,8 @@ pub fn parse_rule_token(token: &str) -> Result<Rule, RuleParseError> {
         destination,
         protocols,
         ports,
+        methods: Vec::new(),
+        paths: Vec::new(),
         action,
     })
 }
@@ -295,6 +297,8 @@ fn parse_dns_rule(
         destination: Destination::Group(DestinationGroup::Host),
         protocols,
         ports: vec![PortRange::single(53)],
+        methods: Vec::new(),
+        paths: Vec::new(),
         action,
     })
 }

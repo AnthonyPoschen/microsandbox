@@ -360,6 +360,10 @@ func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 			for _, p := range r.Protocols {
 				rule.Protocols = append(rule.Protocols, string(p))
 			}
+			for _, method := range r.Methods {
+				rule.Methods = append(rule.Methods, string(method))
+			}
+			rule.Paths = append([]string(nil), r.Paths...)
 			cp.Rules = append(cp.Rules, rule)
 		}
 		out.CustomPolicy = cp
@@ -1239,6 +1243,54 @@ func (h *MetricsStreamHandle) Close() error {
 //
 // interval is rounded up to milliseconds; a zero or negative value uses the
 // runtime minimum (~1 ms).
+// NetworkDecision is one network-policy enforcement event.
+type NetworkDecision = ffi.NetworkDecision
+
+// NetworkDecisionOptions configures NetworkDecisions and NetworkDecisionStream.
+type NetworkDecisionOptions = ffi.NetworkDecisionOptions
+
+// NetworkDecisionSnapshot is a replay of buffered enforcement events.
+type NetworkDecisionSnapshot = ffi.NetworkDecisionSnapshot
+
+// NetworkDecisionStreamHandle is a live network-decision subscription.
+type NetworkDecisionStreamHandle struct {
+	inner *ffi.NetworkDecisionStreamHandle
+}
+
+// Recv blocks until the next decision arrives or ctx is cancelled.
+// Returns nil, nil when the stream has ended (snapshot drained or sandbox exited).
+func (h *NetworkDecisionStreamHandle) Recv(ctx context.Context) (*NetworkDecision, error) {
+	m, err := h.inner.Recv(ctx)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return m, nil
+}
+
+// Close stops the stream and releases Rust-side resources.
+func (h *NetworkDecisionStreamHandle) Close() error {
+	return wrapFFI(h.inner.Close())
+}
+
+// NetworkDecisions reads buffered enforcement events after opts.AfterSequence.
+func (s *Sandbox) NetworkDecisions(ctx context.Context, opts NetworkDecisionOptions) (*NetworkDecisionSnapshot, error) {
+	snap, err := s.inner.NetworkDecisions(ctx, opts)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return snap, nil
+}
+
+// NetworkDecisionStream starts a replay/follow subscription. Close the
+// returned handle when done. Recv returns nil, nil at end-of-stream.
+func (s *Sandbox) NetworkDecisionStream(ctx context.Context, opts NetworkDecisionOptions) (*NetworkDecisionStreamHandle, error) {
+	h, err := s.inner.NetworkDecisionStream(ctx, opts)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return &NetworkDecisionStreamHandle{inner: h}, nil
+}
+
 func (s *Sandbox) MetricsStream(ctx context.Context, interval time.Duration) (*MetricsStreamHandle, error) {
 	var ms uint64
 	if interval > 0 {

@@ -14,6 +14,7 @@ use crate::helpers::{
 };
 use crate::metrics::PyMetricsStream;
 use crate::metrics::convert_metrics;
+use crate::network_decisions::{PyNetworkDecisionStream, convert_event};
 use crate::sandbox_handle::PySandboxHandle;
 use crate::ssh::PySandboxSsh;
 
@@ -902,6 +903,47 @@ impl PySandbox {
                 .into_iter()
                 .map(crate::logs::convert_entry)
                 .collect::<Vec<_>>())
+        })
+    }
+
+    /// Read buffered network-policy decisions after `after_sequence`.
+    #[pyo3(signature = (after_sequence = 0))]
+    fn network_decisions<'py>(
+        &self,
+        py: Python<'py>,
+        after_sequence: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let snap = sandbox
+                .network_decisions(microsandbox::NetworkDecisionOptions {
+                    after_sequence,
+                    follow: false,
+                })
+                .await
+                .map_err(to_py_err)?;
+            Ok(snap.events.iter().map(convert_event).collect::<Vec<_>>())
+        })
+    }
+
+    /// Stream network-policy decisions. Pass follow=True to keep reading
+    /// until the sandbox stops.
+    #[pyo3(signature = (after_sequence = 0, follow = false))]
+    fn network_decision_stream<'py>(
+        &self,
+        py: Python<'py>,
+        after_sequence: u64,
+        follow: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let stream = sandbox.network_decision_stream(microsandbox::NetworkDecisionOptions {
+                after_sequence,
+                follow,
+            });
+            Ok(PyNetworkDecisionStream::new(stream))
         })
     }
 

@@ -37,8 +37,8 @@ use microsandbox_types::{NetworkRateLimitDirection, RateLimitConfigError};
 use crate::secrets::config::SecretConfigError;
 
 use super::{
-    Action, Destination, DestinationGroup, Direction, DomainName, DomainNameError, NetworkPolicy,
-    PortRange, Protocol, Rule,
+    Action, Destination, DestinationGroup, Direction, DomainName, DomainNameError, HttpMethod,
+    NetworkPolicy, PortRange, Protocol, Rule,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -278,6 +278,8 @@ impl NetworkPolicyBuilder {
             direction: initial_direction,
             protocols: Vec::new(),
             ports: Vec::new(),
+            methods: Vec::new(),
+            paths: Vec::new(),
             pending_rules: Vec::new(),
             errors: Vec::new(),
         };
@@ -321,6 +323,8 @@ impl NetworkPolicyBuilder {
                 destination,
                 protocols: pending.protocols,
                 ports: pending.ports,
+                methods: pending.methods,
+                paths: pending.paths,
                 action: pending.action,
             });
         }
@@ -363,6 +367,8 @@ pub struct RuleBuilder {
     direction: Option<Direction>,
     protocols: Vec<Protocol>,
     ports: Vec<PortRange>,
+    methods: Vec<HttpMethod>,
+    paths: Vec<String>,
     pending_rules: Vec<PendingRule>,
     errors: Vec<BuildError>,
 }
@@ -454,6 +460,49 @@ impl RuleBuilder {
     pub fn ports<I: IntoIterator<Item = u16>>(&mut self, ports: I) -> &mut Self {
         for p in ports {
             self.port(p);
+        }
+        self
+    }
+
+    // -- HTTP method / path setters ----------------------------------
+
+    /// Add an HTTP method to the method set (empty = any method).
+    pub fn method(&mut self, method: HttpMethod) -> &mut Self {
+        if !self.methods.contains(&method) {
+            self.methods.push(method);
+        }
+        self
+    }
+
+    /// Add several HTTP methods. Equivalent to calling [`Self::method`]
+    /// once per element; duplicates dedupe via set semantics.
+    pub fn methods<I: IntoIterator<Item = HttpMethod>>(&mut self, methods: I) -> &mut Self {
+        for method in methods {
+            self.method(method);
+        }
+        self
+    }
+
+    /// Add an HTTP origin-form path to the path set (empty = any path).
+    /// Matching is exact after query and fragment are stripped from the
+    /// request-target.
+    pub fn path(&mut self, path: impl Into<String>) -> &mut Self {
+        let path = path.into();
+        if !self.paths.contains(&path) {
+            self.paths.push(path);
+        }
+        self
+    }
+
+    /// Add several HTTP paths. Equivalent to calling [`Self::path`]
+    /// once per element; duplicates dedupe via set semantics.
+    pub fn paths<I, S>(&mut self, paths: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for path in paths {
+            self.path(path);
         }
         self
     }
@@ -670,6 +719,8 @@ impl RuleBuilder {
             destination,
             protocols: self.protocols.clone(),
             ports: self.ports.clone(),
+            methods: self.methods.clone(),
+            paths: self.paths.clone(),
             action,
         });
     }
@@ -751,6 +802,8 @@ struct PendingRule {
     destination: PendingDestination,
     protocols: Vec<Protocol>,
     ports: Vec<PortRange>,
+    methods: Vec<HttpMethod>,
+    paths: Vec<String>,
     action: Action,
 }
 
@@ -856,6 +909,8 @@ fn shadows(earlier: &Rule, later: &Rule) -> bool {
         && destination_covers(&earlier.destination, &later.destination)
         && protocol_set_covers(&earlier.protocols, &later.protocols)
         && port_set_covers(&earlier.ports, &later.ports)
+        && http_method_set_covers(&earlier.methods, &later.methods)
+        && http_path_set_covers(&earlier.paths, &later.paths)
 }
 
 fn direction_covers(earlier: Direction, later: Direction) -> bool {
@@ -907,6 +962,26 @@ fn port_set_covers(earlier: &[PortRange], later: &[PortRange]) -> bool {
             .iter()
             .any(|ep| ep.start <= lp.start && lp.end <= ep.end)
     })
+}
+
+fn http_method_set_covers(earlier: &[HttpMethod], later: &[HttpMethod]) -> bool {
+    if earlier.is_empty() {
+        return true;
+    }
+    if later.is_empty() {
+        return false;
+    }
+    later.iter().all(|method| earlier.contains(method))
+}
+
+fn http_path_set_covers(earlier: &[String], later: &[String]) -> bool {
+    if earlier.is_empty() {
+        return true;
+    }
+    if later.is_empty() {
+        return false;
+    }
+    later.iter().all(|path| earlier.contains(path))
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1107,6 +1182,24 @@ mod tests {
         assert_eq!(p.rules[0].protocols, vec![Protocol::Tcp, Protocol::Udp]);
     }
 
+    #[test]
+    fn method_and_path_filters_accumulate_on_committed_rules() {
+        let p = NetworkPolicy::builder()
+            .egress(|e| {
+                e.tcp()
+                    .method(HttpMethod::Get)
+                    .method(HttpMethod::Head)
+                    .path("/allowed")
+                    .path("/allowed")
+                    .allow()
+                    .any()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(p.rules[0].methods, vec![HttpMethod::Get, HttpMethod::Head]);
+        assert_eq!(p.rules[0].paths, vec!["/allowed".to_string()]);
+    }
+
     /// Mixing the typed `Destination::Group` setter via `.group(...)`
     /// works for users who already have a `DestinationGroup` value.
     #[test]
@@ -1143,6 +1236,8 @@ mod tests {
             destination: Destination::Cidr("10.0.0.0/8".parse().unwrap()),
             protocols: vec![],
             ports: vec![],
+            methods: Vec::new(),
+            paths: Vec::new(),
             action: Action::Allow,
         };
         let narrower = Rule {
@@ -1150,6 +1245,8 @@ mod tests {
             destination: Destination::Cidr("10.0.0.5/32".parse().unwrap()),
             protocols: vec![],
             ports: vec![],
+            methods: Vec::new(),
+            paths: Vec::new(),
             action: Action::Allow,
         };
         assert!(

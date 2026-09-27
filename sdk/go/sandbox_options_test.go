@@ -772,6 +772,33 @@ func TestFFIWireShape_NetworkCustomRules(t *testing.T) {
 		t.Fatalf("rule[0] details = %v", r0)
 	}
 
+	gotL7 := marshalCreateOptions(t,
+		WithImage("alpine"),
+		WithNetwork(&NetworkConfig{
+			DefaultEgress:  PolicyActionDeny,
+			DefaultIngress: PolicyActionAllow,
+			Rules: []PolicyRule{
+				{
+					Action:      PolicyActionAllow,
+					Direction:   PolicyDirectionEgress,
+					Destination: "*",
+					Protocol:    PolicyProtocolTCP,
+					Methods:     []PolicyHttpMethod{PolicyHttpMethodGET, PolicyHttpMethodPOST},
+					Paths:       []string{"/api", "/health"},
+				},
+			},
+		}),
+	)
+	netL7 := mustField(t, gotL7, "network").(map[string]any)
+	cpL7 := netL7["custom_policy"].(map[string]any)
+	rL7 := cpL7["rules"].([]any)[0].(map[string]any)
+	methods, _ := rL7["methods"].([]any)
+	paths, _ := rL7["paths"].([]any)
+	if len(methods) != 2 || methods[0] != "GET" || methods[1] != "POST" ||
+		len(paths) != 2 || paths[0] != "/api" || paths[1] != "/health" {
+		t.Fatalf("method/path filters dropped on FFI construct: %v", rL7)
+	}
+
 	deny := net["deny_domains"].([]any)
 	if len(deny) != 1 || deny[0] != "blocked.example.com" {
 		t.Fatalf("deny_domains = %v", deny)

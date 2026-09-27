@@ -600,7 +600,7 @@ fn control_socket_path(name: &str) -> MicrosandboxResult<std::path::PathBuf> {
 }
 
 #[cfg(unix)]
-fn control_socket_path_candidates(name: &str) -> Vec<std::path::PathBuf> {
+pub(crate) fn control_socket_path_candidates(name: &str) -> Vec<std::path::PathBuf> {
     control_socket_paths(crate::runtime::sandbox_agent_socket_path_candidates(name))
 }
 
@@ -686,7 +686,7 @@ async fn connect_control_pipe(
 }
 
 /// Send one control request line and parse the reply.
-async fn control_request(
+pub(crate) async fn control_request(
     name: &str,
     request: String,
 ) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse> {
@@ -711,7 +711,7 @@ async fn control_request(
 }
 
 #[cfg(unix)]
-async fn connect_control_socket(
+pub(crate) async fn connect_control_socket(
     candidates: impl IntoIterator<Item = std::path::PathBuf>,
 ) -> std::io::Result<tokio::net::UnixStream> {
     let mut last_error = None;

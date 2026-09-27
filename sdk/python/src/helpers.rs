@@ -1261,11 +1261,15 @@ fn apply_network(
                 } else {
                     Vec::new()
                 };
+                let methods = parse_http_methods(extract_opt::<Vec<String>>(&rd, "methods")?)?;
+                let paths = extract_opt::<Vec<String>>(&rd, "paths")?.unwrap_or_default();
                 rules.push(microsandbox_network::policy::Rule {
                     direction,
                     destination,
                     protocols,
                     ports,
+                    methods,
+                    paths,
                     action,
                 });
             }
@@ -2080,6 +2084,22 @@ fn parse_passthrough_policy(
     }
 
     Ok(ViolationAction::Passthrough(patterns))
+}
+
+fn parse_http_methods(
+    raw: Option<Vec<String>>,
+) -> PyResult<Vec<microsandbox_network::policy::HttpMethod>> {
+    let mut methods = Vec::new();
+    for token in raw.unwrap_or_default() {
+        let method =
+            microsandbox_network::policy::HttpMethod::from_token(&token).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("unknown HTTP method: {token}"))
+            })?;
+        if !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+    Ok(methods)
 }
 
 fn extract_opt<'py, T: FromPyObject<'py>>(

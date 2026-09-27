@@ -794,6 +794,14 @@ export declare class RuleBuilder {
   portRange(lo: number, hi: number): this
   /** Add multiple single ports. */
   ports(ports: Array<number>): this
+  /** Add an HTTP method (RFC 9110 plus `PATCH` / `QUERY`). */
+  method(method: string): this
+  /** Add several HTTP methods. */
+  methods(methods: Array<string>): this
+  /** Add an HTTP origin-form path to the path set. */
+  path(path: string): this
+  /** Add several HTTP paths. */
+  paths(paths: Array<string>): this
   allowPublic(): this
   denyPublic(): this
   allowPrivate(): this
@@ -2085,6 +2093,8 @@ export interface NetworkPolicyRule {
   destination: NetworkPolicyDestination
   protocols: Array<string>
   ports: Array<NetworkPolicyPortRange>
+  methods: Array<string>
+  paths: Array<string>
   action: string
 }
 

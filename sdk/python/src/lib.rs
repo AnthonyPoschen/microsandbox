@@ -6,6 +6,7 @@ mod helpers;
 mod image;
 mod logs;
 mod metrics;
+mod network_decisions;
 mod sandbox;
 mod sandbox_handle;
 mod setup;
@@ -84,6 +85,8 @@ fn _microsandbox(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<snapshot::PySnapshotHandle>()?;
     m.add_class::<metrics::PyMetricsStream>()?;
     m.add_class::<metrics::PySandboxMetrics>()?;
+    m.add_class::<network_decisions::PyNetworkDecision>()?;
+    m.add_class::<network_decisions::PyNetworkDecisionStream>()?;
     m.add_class::<logs::PyLogEntry>()?;
     m.add_class::<logs::PyLogStream>()?;
     m.add_class::<sandbox::PyPullSession>()?;

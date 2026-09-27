@@ -259,6 +259,13 @@ pub fn run(args: SandboxArgs) -> ! {
         sandbox_slot: launch.sandbox_slot,
     };
 
+    #[cfg(feature = "net")]
+    let network_decision_buffer_capacity = microsandbox_network::clamp_decision_buffer_capacity(
+        launch
+            .network_decision_buffer_capacity
+            .unwrap_or(microsandbox_network::DEFAULT_DECISION_BUFFER_CAPACITY),
+    );
+
     let config = Config {
         sandbox_name: args.sandbox_name,
         sandbox_id: args.sandbox_id,
@@ -284,6 +291,8 @@ pub fn run(args: SandboxArgs) -> ! {
         forward_output: args.forward_output,
         idle_timeout_secs: launch.lifecycle.idle_timeout_secs,
         max_duration_secs: launch.lifecycle.max_duration_secs,
+        #[cfg(feature = "net")]
+        network_decision_buffer_capacity,
         metrics_sample_interval_ms: if launch.metrics.disabled {
             None
         } else {

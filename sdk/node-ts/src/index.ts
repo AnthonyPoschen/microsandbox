@@ -579,3 +579,4 @@ export type PortRange = _Types.PortRange;
 
 export const Rule = _Factories.Rule;
 export type Rule = _Types.Rule;
+export type HttpMethod = _Types.HttpMethod;

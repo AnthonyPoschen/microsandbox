@@ -104,6 +104,22 @@ where
         self.remove_key(key);
     }
 
+    /// Visit every non-expired key that currently contains `member`.
+    pub fn for_each_live_key(&self, member: &M, now: Instant, mut visit: impl FnMut(&K)) {
+        let Some(keys) = self.by_member.get(member) else {
+            return;
+        };
+        for key in keys {
+            let live = self
+                .by_key
+                .get(key)
+                .is_some_and(|entry| entry.expires_at > now);
+            if live {
+                visit(key);
+            }
+        }
+    }
+
     /// Returns true if `member` is associated with any non-expired key that
     /// satisfies `predicate`.
     pub fn member_matches(
@@ -342,6 +358,21 @@ mod tests {
             false
         });
         assert!(!seen_alpha, "evicted key leaked through reverse index");
+    }
+
+    #[test]
+    fn for_each_live_key_skips_expired_keys() {
+        let mut index = TtlReverseIndex::<&str, i32>::default();
+        let now = Instant::now();
+
+        index.insert("alpha", [1], Duration::from_secs(5), now);
+        index.insert("beta", [1], Duration::from_secs(60), now);
+
+        let later = now + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        index.for_each_live_key(&1, later, |key| seen.push(*key));
+        seen.sort_unstable();
+        assert_eq!(seen, vec!["beta"]);
     }
 
     #[test]

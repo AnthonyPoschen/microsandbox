@@ -8,12 +8,33 @@ from microsandbox import (
     Action,
     DestGroup,
     Destination,
+    HttpMethod,
     Network,
     NetworkPolicy,
     NetworkProfile,
     Protocol,
     Rule,
 )
+
+
+def test_http_method_and_path_filters_serialize_and_omit_when_empty() -> None:
+    policy = NetworkPolicy(
+        rules=(
+            Rule.allow(
+                destination=Destination.ip("1.1.1.1"),
+                protocol=Protocol.TCP,
+                port=80,
+                methods=(HttpMethod.GET, HttpMethod.POST),
+                paths=("/api", "/health"),
+            ),
+            Rule.allow(destination=Destination.group(DestGroup.PUBLIC)),
+        ),
+    )
+    rules = policy._to_dict()["rules"]
+    assert rules[0]["methods"] == ["GET", "POST"]
+    assert rules[0]["paths"] == ["/api", "/health"]
+    assert "methods" not in rules[1]
+    assert "paths" not in rules[1]
 
 
 def test_typed_ip_destination_serializes_with_kind() -> None:

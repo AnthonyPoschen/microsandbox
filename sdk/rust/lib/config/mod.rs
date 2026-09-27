@@ -333,6 +333,12 @@ pub struct RuntimeConfig {
 
     /// Host-owned placement profiles selectable by sandbox name.
     pub placement_profiles: BTreeMap<String, PlacementProfile>,
+
+    /// Per-sandbox network-policy decision ring-buffer capacity.
+    ///
+    /// Defaults to 4096 when unset. Values are clamped to 16..=100_000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_decision_buffer_capacity: Option<usize>,
 }
 
 /// Controls buffered host dirty data for writable raw disks.

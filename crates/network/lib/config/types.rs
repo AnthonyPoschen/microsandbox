@@ -307,6 +307,18 @@ mod tests {
         policy.rules.push(Rule::allow_egress(Destination::Cidr(
             "151.101.0.0/16".parse().unwrap(),
         )));
+        policy.rules.push(Rule {
+            direction: crate::policy::Direction::Egress,
+            destination: Destination::Any,
+            protocols: vec![crate::policy::Protocol::Tcp],
+            ports: Vec::new(),
+            methods: vec![
+                crate::policy::HttpMethod::Get,
+                crate::policy::HttpMethod::Post,
+            ],
+            paths: vec!["/api".to_string(), "/health".to_string()],
+            action: crate::policy::Action::Allow,
+        });
         config.policy = policy;
         config.dns.nameservers = vec![
             "1.1.1.1:53".parse::<Nameserver>().unwrap(),
@@ -341,6 +353,19 @@ mod tests {
         let wire_config: microsandbox_types::NetworkSpec =
             serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
         assert!(wire_config.strict);
+        let l7 = wire_policy
+            .rules
+            .iter()
+            .find(|rule| !rule.methods.is_empty() || !rule.paths.is_empty())
+            .expect("method/path rule must survive the wire round-trip");
+        assert_eq!(
+            l7.methods,
+            vec![
+                microsandbox_types::HttpMethod::Get,
+                microsandbox_types::HttpMethod::Post,
+            ]
+        );
+        assert_eq!(l7.paths, vec!["/api".to_string(), "/health".to_string()]);
 
         // Snake_case is the canonical serialized form.
         assert_eq!(
