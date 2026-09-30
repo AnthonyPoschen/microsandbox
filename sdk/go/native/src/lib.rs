@@ -62,7 +62,9 @@ use microsandbox::{
     snapshot::{SaveOpts, SnapshotFormat, SnapshotScope},
     volume::{Volume, VolumeBuilder, VolumeFs, VolumeHandle, VolumeKind},
 };
-use microsandbox_network::{builder::ViolationActionBuilder, secrets::config::ViolationAction};
+use microsandbox_network::{
+    builder::ViolationActionBuilder, policy::DomainName, secrets::config::ViolationAction,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
 use tokio_stream::StreamExt as _;
@@ -1238,23 +1240,9 @@ fn apply_network(
     mut builder: microsandbox::sandbox::SandboxBuilder,
     net: &NetworkOpts,
 ) -> Result<microsandbox::sandbox::SandboxBuilder, FfiError> {
-    use microsandbox_network::policy::{Action, Destination, Direction, NetworkPolicy, Rule};
+    use microsandbox_network::policy::{Action, Direction, NetworkPolicy, Rule};
 
-    // Bulk DNS-level deny rules (composed up-front so any error short-
-    // circuits before we touch the builder).
-    let mut bulk_deny: Vec<Rule> = Vec::new();
-    for d in &net.deny_domains {
-        let domain = d
-            .parse()
-            .map_err(|e| FfiError::invalid_argument(format!("deny_domains[{d:?}]: {e}")))?;
-        bulk_deny.push(Rule::deny_egress(Destination::Domain(domain)));
-    }
-    for s in &net.deny_domain_suffixes {
-        let suffix = s
-            .parse()
-            .map_err(|e| FfiError::invalid_argument(format!("deny_domain_suffixes[{s:?}]: {e}")))?;
-        bulk_deny.push(Rule::deny_egress(Destination::DomainSuffix(suffix)));
-    }
+    let (dns_deny_domains, dns_deny_domain_suffixes) = parse_dns_deny_filters(net)?;
 
     let mut policy_set = false;
 
@@ -1275,7 +1263,7 @@ fn apply_network(
             None => Action::Allow,
         };
 
-        let mut rules = bulk_deny.clone();
+        let mut rules = Vec::new();
         for r in &cp.rules {
             let action = parse_action(&r.action)?;
             let direction = match r.direction.as_str() {
@@ -1312,17 +1300,10 @@ fn apply_network(
         policy_set = true;
     }
 
-    // No custom policy was specified, but legacy DNS deny entries
-    // were. Use permissive defaults so the rest of the network keeps
-    // working — preserves the legacy "full network minus blocked domains"
-    // semantics.
-    if !policy_set && !bulk_deny.is_empty() {
-        let policy = NetworkPolicy {
-            default_egress: Action::Allow,
-            default_ingress: Action::Allow,
-            rules: bulk_deny,
-        };
-        builder = builder.network(|n| n.policy(policy));
+    // Legacy DNS filters without a custom policy retain the historical
+    // "full network minus blocked domains" behavior.
+    if !policy_set && (!dns_deny_domains.is_empty() || !dns_deny_domain_suffixes.is_empty()) {
+        builder = builder.network(|n| n.policy(NetworkPolicy::allow_all()));
     }
 
     if let Some(ref raw) = net.ipv4_pool {
@@ -1371,6 +1352,15 @@ fn apply_network(
                     d = d.query_timeout_ms(ms);
                 }
                 d
+            })
+        });
+    }
+
+    if !dns_deny_domains.is_empty() || !dns_deny_domain_suffixes.is_empty() {
+        builder = builder.network(|n| {
+            n.dns_overlay(|dns| {
+                dns.deny_domains(dns_deny_domains.clone())
+                    .deny_domain_suffixes(dns_deny_domain_suffixes.clone())
             })
         });
     }
@@ -1469,6 +1459,28 @@ fn apply_network(
     }
 
     Ok(builder)
+}
+
+fn parse_dns_deny_filters(
+    net: &NetworkOpts,
+) -> Result<(Vec<DomainName>, Vec<DomainName>), FfiError> {
+    // Bulk DNS-only filters are configured separately from egress rules so a
+    // denied hostname cannot block traffic to a shared resolved proxy IP.
+    let mut domains = Vec::with_capacity(net.deny_domains.len());
+    for domain in &net.deny_domains {
+        domains.push(
+            domain.parse().map_err(|e| {
+                FfiError::invalid_argument(format!("deny_domains[{domain:?}]: {e}"))
+            })?,
+        );
+    }
+    let mut suffixes = Vec::with_capacity(net.deny_domain_suffixes.len());
+    for suffix in &net.deny_domain_suffixes {
+        suffixes.push(suffix.parse().map_err(|e| {
+            FfiError::invalid_argument(format!("deny_domain_suffixes[{suffix:?}]: {e}"))
+        })?);
+    }
+    Ok((domains, suffixes))
 }
 
 fn apply_port_binding(
@@ -7364,6 +7376,22 @@ mod tests {
             }
             other => panic!("expected domain destination, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_domain_denies_configure_dns_filters_without_egress_rules() {
+        let network = NetworkOpts {
+            deny_domains: vec!["blocked.example".into()],
+            deny_domain_suffixes: vec![".blocked-suffix.example".into()],
+            ..Default::default()
+        };
+        let (domains, suffixes) = match parse_dns_deny_filters(&network) {
+            Ok(filters) => filters,
+            Err(_) => panic!("parse DNS filters"),
+        };
+
+        assert_eq!(domains[0].as_str(), "blocked.example");
+        assert_eq!(suffixes[0].as_str(), "blocked-suffix.example");
     }
 
     #[test]

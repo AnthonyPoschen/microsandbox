@@ -292,7 +292,7 @@ impl DnsForwarder {
         // default policies fail closed unless a rule allows the name or
         // the DNS protocol/port.
         let (dns_action, matched_rule) =
-            decide_dns_action(&self.network_policy, &domain, transport);
+            decide_dns_action_with_filters(&self.network_policy, &self.config, &domain, transport);
         let (correlation_id, lookup_id) = self.shared.begin_dns_lookup(&domain);
         emit_dns(
             self.shared.decisions(),
@@ -847,6 +847,30 @@ fn decide_upstream_with_platform(
 /// function — no I/O — so the denial logic is testable without a real
 /// upstream client. Names that don't parse as a [`DomainName`] take the
 /// nameless path, where only `Any` rules can match.
+fn decide_dns_action_with_filters(
+    policy: &NetworkPolicy,
+    config: &NormalizedDnsConfig,
+    domain: &str,
+    transport: Transport,
+) -> (Action, String) {
+    match domain.parse::<DomainName>() {
+        Ok(canonical) => {
+            if config.deny_domains.iter().any(|name| name == &canonical) {
+                return (Action::Deny, "dns_deny_domain".into());
+            }
+            if config
+                .deny_domain_suffixes
+                .iter()
+                .any(|suffix| matches_suffix(canonical.as_str(), suffix.as_str()))
+            {
+                return (Action::Deny, "dns_deny_domain_suffix".into());
+            }
+            decide_dns_action(policy, domain, transport)
+        }
+        Err(_) => decide_dns_action(policy, domain, transport),
+    }
+}
+
 fn decide_dns_action(
     policy: &NetworkPolicy,
     domain: &str,
@@ -864,6 +888,13 @@ fn decide_dns_action(
             transport.upstream_port(),
         ),
     }
+}
+
+fn matches_suffix(name: &str, suffix: &str) -> bool {
+    name == suffix
+        || name
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// Build a status-only response (no answers, no authority) with the given
@@ -1052,6 +1083,42 @@ mod tests {
         msg
     }
 
+    #[test]
+    fn dns_only_domain_filters_do_not_change_connection_policy() {
+        let config = NormalizedDnsConfig {
+            rebind_protection: false,
+            nameservers: Vec::new(),
+            deny_domains: vec!["blocked.example".parse().unwrap()],
+            deny_domain_suffixes: vec!["blocked-suffix.example".parse().unwrap()],
+            query_timeout: Duration::from_millis(300),
+        };
+        let policy = NetworkPolicy::allow_all();
+
+        assert_eq!(
+            decide_dns_action_with_filters(&policy, &config, "blocked.example", Transport::Udp).0,
+            Action::Deny
+        );
+        assert_eq!(
+            decide_dns_action_with_filters(
+                &policy,
+                &config,
+                "api.blocked-suffix.example",
+                Transport::Udp
+            )
+            .0,
+            Action::Deny
+        );
+        assert_eq!(
+            policy.evaluate_egress(
+                "203.0.113.8:443".parse().unwrap(),
+                Protocol::Tcp,
+                &SharedState::new(4)
+            ),
+            Action::Allow,
+            "DNS-only filters must not deny a shared connection IP"
+        );
+    }
+
     /// Black-hole UDP server: recv the query, never send a reply, so the
     /// client hits its per-query timeout. Mirrors `dns::client::tests`.
     async fn blackhole_udp() -> SocketAddr {
@@ -1110,6 +1177,8 @@ mod tests {
         let config = Arc::new(NormalizedDnsConfig {
             rebind_protection: false,
             nameservers: Vec::new(),
+            deny_domains: Vec::new(),
+            deny_domain_suffixes: Vec::new(),
             query_timeout: Duration::from_millis(300),
         });
         let mut configured = Vec::new();
@@ -1166,6 +1235,8 @@ mod tests {
         forwarder_mut.config = Arc::new(NormalizedDnsConfig {
             rebind_protection: true,
             nameservers: Vec::new(),
+            deny_domains: Vec::new(),
+            deny_domain_suffixes: Vec::new(),
             query_timeout: Duration::from_millis(300),
         });
 

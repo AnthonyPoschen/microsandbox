@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::config::DnsConfig;
 use crate::dns::nameserver::Nameserver;
+use crate::policy::DomainName;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -25,6 +26,8 @@ pub(in crate::dns) struct NormalizedDnsConfig {
     /// to the host's configured resolvers. Hostnames are resolved once
     /// at forwarder-task startup via the host's own resolver.
     pub(in crate::dns) nameservers: Vec<Nameserver>,
+    pub(in crate::dns) deny_domains: Vec<DomainName>,
+    pub(in crate::dns) deny_domain_suffixes: Vec<DomainName>,
     /// Per-query timeout.
     pub(in crate::dns) query_timeout: Duration,
 }
@@ -39,6 +42,8 @@ impl NormalizedDnsConfig {
         Self {
             rebind_protection: config.rebind_protection,
             nameservers: config.nameservers,
+            deny_domains: config.deny_domains,
+            deny_domain_suffixes: config.deny_domain_suffixes,
             query_timeout: Duration::from_millis(config.query_timeout_ms),
         }
     }

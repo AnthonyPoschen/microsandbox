@@ -10,7 +10,7 @@ use microsandbox_types::{NetworkRateLimiterConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
-use crate::policy::NetworkPolicy;
+use crate::policy::{DomainName, NetworkPolicy};
 use crate::proxy::{OutboundProxy, ResolvedOutboundProxy};
 use crate::secrets::config::SecretsConfig;
 
@@ -153,6 +153,16 @@ pub struct DnsConfig {
     #[serde(default)]
     pub nameservers: Vec<Nameserver>,
 
+    /// Exact DNS names to refuse before forwarding. These filters apply only
+    /// to DNS queries; they do not deny connections to a shared resolved IP.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_domains: Vec<DomainName>,
+
+    /// DNS suffixes to refuse before forwarding. Each suffix matches its apex
+    /// and label-aligned subdomains, but does not deny shared resolved IPs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_domain_suffixes: Vec<DomainName>,
+
     /// Per-query timeout in milliseconds. Default: 5000.
     #[serde(default = "default_query_timeout_ms")]
     pub query_timeout_ms: u64,
@@ -257,6 +267,8 @@ impl Default for DnsConfig {
         Self {
             rebind_protection: true,
             nameservers: Vec::new(),
+            deny_domains: Vec::new(),
+            deny_domain_suffixes: Vec::new(),
             query_timeout_ms: default_query_timeout_ms(),
         }
     }

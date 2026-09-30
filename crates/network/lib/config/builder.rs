@@ -19,7 +19,7 @@ use crate::config::{
     PublishedPort,
 };
 use crate::dns::Nameserver;
-use crate::policy::{BuildError, NetworkPolicy};
+use crate::policy::{BuildError, DomainName, NetworkPolicy};
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretSource, ViolationAction,
 };
@@ -413,6 +413,26 @@ impl DnsBuilder {
         I::Item: Into<Nameserver>,
     {
         self.config.nameservers = nameservers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Reject exact DNS names without applying the deny to connections that
+    /// later share a resolved IP address.
+    pub fn deny_domains<I>(mut self, domains: I) -> Self
+    where
+        I: IntoIterator<Item = DomainName>,
+    {
+        self.config.deny_domains = domains.into_iter().collect();
+        self
+    }
+
+    /// Reject DNS names matching these suffixes without applying the deny to
+    /// connections that later share a resolved IP address.
+    pub fn deny_domain_suffixes<I>(mut self, suffixes: I) -> Self
+    where
+        I: IntoIterator<Item = DomainName>,
+    {
+        self.config.deny_domain_suffixes = suffixes.into_iter().collect();
         self
     }
 
